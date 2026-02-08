@@ -1,0 +1,19 @@
+# conf/label_generator/default.yaml
+
+_target_: models.ddp_predictor.LabelGenerator
+
+# --- Core Mode ---
+# 'pixel': Generate mask based on pixel difference (recommended).
+# 'feature': Generate mask based on DINOv2 feature difference.
+mode: pixel
+
+# --- Thresholds ---
+pixel_threshold: 0.1
+feature_threshold: 45.0
+
+# --- Feature Mode Specific ---
+d_feature: 384  # DINOv2-ViT-S/14 feature dimension.
+
+# --- Grid Size (must match DINOv2 output) ---
+grid_h: 14
+grid_w: 14

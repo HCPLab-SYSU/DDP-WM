@@ -1,0 +1,45 @@
+# conf/predictor/ddp_wm.yaml
+_target_: models.ddp_predictor.DDP_Predictor
+
+# --- Core Training Stage Control ---
+# This parameter determines how the model is initialized and which parts are trained.
+# Optional Values:
+#   'localization':        Train only Stage 1 & 2 (History Fusion + Localization Network).
+#   'primary_predictor':   Train Stage 3 (Primary Predictor), freezing preceding modules.
+#   'lrm':                 Train Stage 4 (LRM), freezing preceding modules.
+#   'inference':           All modules are loaded and frozen，for inference or evaluation.
+training_stage: ${model.training_stage}  
+
+# --- Global/Shared Parameters ---
+# These parameters will be passed to multiple sub-modules
+num_frames: ${num_hist}                 # from the top-level train.yaml Inherited
+num_patches: 196                       # For 224x224, 14x14 patches (14*14=196)
+
+# --- Sub-module Hyperparameters ---
+# Each section corresponds to a class in ddp_predictor.py
+
+# Stage 1: HistoricalInformationFusion
+history_fusion:
+  n_heads: 4
+  dropout: 0.1
+
+# Stage 2: DynamicLocalizationNetwork
+localizer:
+  reduced_dim: 192
+  num_layers: 6
+  n_heads: 4         # number of heads for the localization network itself
+  mlp_dim: 768
+  dropout: 0.1       # for the localization network itselfdropout
+  partition_precision: 4 # the precision of the secondary resolution(times the square root)
+
+# Stage 3: SparsePrimaryDynamicsPredictor
+primary_predictor:
+  num_layers: 6
+  n_heads: 16         # number of heads for the primary predictor itself
+  mlp_dim: 2048
+  dropout: 0.1       # for the primary predictor itselfdropout
+
+# Stage 4: LowRankCorrectionModule (LRM)
+lrm:
+  n_heads: 4         # LRMits own number of heads
+  dropout: 0.        # LRMits own dropout
