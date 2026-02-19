@@ -54,7 +54,7 @@ class HistoricalInformationFusion(nn.Module):
             if self.hist_time_embeds is not None:
                 # This is a trick, Ensure that even without history frames, these parameters are also included in the computation graph
                 # Their gradients will be0, but it won't cause an error for being unused
-                dummy_sum = self.history_encoder.parameters().__next__().sum() * 0 + \
+                dummy_sum = sum(p.sum() for p in self.history_encoder.parameters()) * 0 + \
                             self.hist_query_pos.sum() * 0 + \
                             self.hist_mem_pos.sum() * 0 + \
                             self.hist_time_embeds.sum() * 0
@@ -182,16 +182,10 @@ class SparsePrimaryDynamicsPredictor(nn.Module):
         B, _, N, D = z_t_prime.shape
         z_t_prime = z_t_prime.squeeze(1)
 
-        # 1. Extract foreground using the mask token
-        # z_t_prime[mask] will return a (B*K, D) 's flattened tensor
-        # We need reshape back (B, K, D)
-        K = mask.sum(dim=1)[0].item() # Assuming that for each sample, theKsame
-        fg_tokens = z_t_prime[mask].view(B, K, D)
-
-        # 2. Perform self-attention through the primary predictor
-        # dino_wm input [B, K, D], output [B, K, D]
-        next_fg_tokens = self.dino_wm(fg_tokens)
-
+        # Perform self-attention through the primary predictor
+        # dino_wm input [B, N, D], output [B, K, D]
+        next_fg_tokens = self.dino_wm(z_t_prime, mask)
+   
         return next_fg_tokens
 
         
@@ -439,9 +433,9 @@ class DDP_Predictor(nn.Module):
             return {'pred_bg': updated_bg_tokens, 'mask': mask}
         
         # --- Combine foreground and background, form the next frame ---
-        z_t_plus_1 = torch.zeros_like(z_t_prime_full)
-        z_t_plus_1[mask] = pred_fg_tokens.view(-1, z_t_plus_1.size(-1))
-        z_t_plus_1[~mask] = updated_bg_tokens.view(-1, z_t_plus_1.size(-1))
+        z_t_plus_1 = torch.zeros_like(z_history[:,-1])
+        z_t_plus_1[mask] = pred_fg_tokens.view(-1, z_t_prime_full.size(-1))
+        z_t_plus_1[~mask] = updated_bg_tokens.view(-1, z_t_prime_full.size(-1))
 
         # --- Inference stage ---
         return {'final_prediction': z_t_plus_1.unsqueeze(1)}

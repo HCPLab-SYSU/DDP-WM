@@ -205,7 +205,7 @@ class Trainer:
                     continue
                 
                 # Get the object instance to be saved (e.g., self.encoder, self.encoder_optimizer)
-                obj_to_save = self.__dict__[k]
+                obj_to_save = self.__dict__.get(k, None)
                 
                 # Use unwrap_model (if it is a model)
                 if hasattr(obj_to_save, "module"):
@@ -246,11 +246,11 @@ class Trainer:
             
             value = ckpt[k]
             
-            # if k == "epoch":
-            #     self.epoch = value
-            #     continue
+            if k == "epoch":
+                # self.epoch = value
+                continue
             
-            obj_to_load = self.__dict__[k]
+            obj_to_load = self.__dict__.get(k, None)
 
             try:
                 if hasattr(obj_to_load, "load_state_dict"):
@@ -508,12 +508,10 @@ class Trainer:
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
             # if i==2:break
-            obs, act, state = data
-            plot = 0  # do not plot
-            self.model.train()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
+            # 1. Get complete batch data
+            full_obs, full_act, full_state = data
+            plot = 0 
+            T_full = full_obs['visual'].shape[1] # e.g., T_full = 4
 
             self.encoder_optimizer.zero_grad()
             if self.cfg.has_decoder:
@@ -522,8 +520,123 @@ class Trainer:
                 self.predictor_optimizer.zero_grad()
                 self.action_encoder_optimizer.zero_grad()
 
-            self.accelerator.backward(loss)
+            # 3. Internal time loop
+            for hist_len in range(1, T_full):
+                
+                # 3.1. Prepare sub-sample
+                T_slice = hist_len + 1  # e.g., h=1 -> T_slice=2
+                
+                # Skip if complete data is not long enough
+                if T_full < T_slice:
+                    continue
+                T_start = 0
 
+                # Slice data
+                obs_slice = {k: v[:, T_start:T_slice, ...] for k, v in full_obs.items()}
+                act_slice = full_act[:, T_start:T_slice, ...]
+                state_slice = full_state[:, T_start:T_slice, ...]
+
+                # 3.2. Move training step into internal loop
+                self.model.train()
+                # Use sliced data
+                z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                    obs_slice, act_slice 
+                )
+
+                self.accelerator.backward(loss)
+
+                # 3.3. Collect and aggregate losses
+                loss = self.accelerator.gather_for_metrics(loss).mean()
+
+                loss_components = self.accelerator.gather_for_metrics(loss_components)
+                loss_components = {
+                    key: value.mean().item() for key, value in loss_components.items()
+                }
+                
+                # Log prefix, prevent overwriting
+                log_prefix = f"train_h{hist_len}_"
+
+                # 3.4. Move plotting and evaluation logic into internal loop
+                if self.cfg.has_decoder and plot:
+                    # err_eval logic
+                    if self.cfg.has_predictor:
+                        # z_out is (B, 1, N, E), corresponding to t=prediction for hist_len
+                        z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                        
+                        # z_gt is (B, T_slice, N, E)
+                        z_gt = self.model.encode_obs(obs_slice)  
+                        
+                        # z_tgt is t=ground truth for hist_len (B, 1, N, E)
+                        z_tgt = slice_trajdict_with_t(z_gt, start_idx=hist_len)  
+
+                        # state_tgt is t=ground truth for hist_len (B, 1, dim)
+                        state_tgt = state_slice[:, -1:]  
+                        
+                        err_logs = self.err_eval(z_obs_out, z_tgt)
+                        err_logs = self.accelerator.gather_for_metrics(err_logs)
+                        err_logs = {
+                            key: value.mean().item() for key, value in err_logs.items()
+                        }
+                        # Add prefix
+                        err_logs = {f"{log_prefix}{k}": [v] for k, v in err_logs.items()}
+                        self.logs_update(err_logs)
+
+                    # Predicted image (visual_out) evaluation
+                    if visual_out is not None:
+                        # visual_out is (B, 1, C, H, W)
+                        # obs_slice["visual"] is (B, T_slice, C, H, W)
+                        # Target is the last frame obs_slice["visual"][:, -1]
+                        
+                        # Simplification: t loop no longer needed as only one frame is predicted
+                        img_pred_scores = eval_images(
+                            visual_out[:, 0], # (B, C, H, W)
+                            obs_slice["visual"][:, -1] # (B, C, H, W)
+                        )
+                        img_pred_scores = self.accelerator.gather_for_metrics(
+                            img_pred_scores
+                        )
+                        # Add prefix
+                        img_pred_scores = {
+                            f"{log_prefix}img_{k}_pred": [v.mean().item()]
+                            for k, v in img_pred_scores.items()
+                        }
+                        self.logs_update(img_pred_scores)
+
+                    # Reconstructed image (visual_reconstructed) evaluation
+                    if visual_reconstructed is not None:
+                        # visual_reconstructed is (B, T_slice, C, H, W)
+                        # Loop T_slice (e.g., 2, 3, 4) times
+                        for t in range(T_slice):  
+                            img_reconstruction_scores = eval_images(
+                                visual_reconstructed[:, t], obs_slice["visual"][:, t]
+                            )
+                            img_reconstruction_scores = self.accelerator.gather_for_metrics(
+                                img_reconstruction_scores
+                            )
+                            # Add prefix and time t
+                            img_reconstruction_scores = {
+                                f"{log_prefix}img_{k}_reconstructed_t{t}": [v.mean().item()]
+                                for k, v in img_reconstruction_scores.items()
+                            }
+                            self.logs_update(img_reconstruction_scores)
+
+                    # Update plot function call
+                    self.plot_samples(
+                        obs_slice["visual"], # Use slice
+                        visual_out,
+                        visual_reconstructed,
+                        self.epoch,
+                        # Create unique batch id to prevent file overwriting
+                        batch=(i * T_full - i) + (hist_len - 1),  
+                        num_samples=self.num_reconstruct_samples,
+                        phase=f"train_h{hist_len}", # Unique phase name
+                    )
+
+                # 3.5. Update log dictionary (with prefix)
+                loss_components = {f"{log_prefix}{k}": [v] for k, v in loss_components.items()}
+                self.logs_update(loss_components)
+            
+            # Internal loop ends
             if self.model.train_encoder:
                 self.encoder_optimizer.step()
             if self.cfg.has_decoder and self.model.train_decoder:
@@ -531,74 +644,7 @@ class Trainer:
             if self.cfg.has_predictor and self.model.train_predictor:
                 self.predictor_optimizer.step()
                 self.action_encoder_optimizer.step()
-
-            loss = self.accelerator.gather_for_metrics(loss).mean()
-
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
-            loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
-            }
-            if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"train_{k}": [v] for k, v in err_logs.items()}
-
-                    self.logs_update(err_logs)
-
-                if visual_out is not None:
-                    for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
-                    ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
-                        )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
-                        )
-                        img_pred_scores = {
-                            f"train_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
-                        }
-                        self.logs_update(img_pred_scores)
-
-                if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
-                        )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
-                        )
-                        img_reconstruction_scores = {
-                            f"train_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
-                        }
-                        self.logs_update(img_reconstruction_scores)
-
-                self.plot_samples(
-                    obs["visual"],
-                    visual_out,
-                    visual_reconstructed,
-                    self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="train",
-                )
-
-            loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
-
+ 
     def val(self):
         print('val')
         self.model.eval()

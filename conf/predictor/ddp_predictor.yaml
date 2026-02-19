@@ -27,7 +27,7 @@ history_fusion:
 localizer:
   reduced_dim: 192
   num_layers: 6
-  n_heads: 4         # number of heads for the localization network itself
+  n_heads: 3         # number of heads for the localization network itself
   mlp_dim: 768
   dropout: 0.1       # for the localization network itselfdropout
   partition_precision: 4 # the precision of the secondary resolution(times the square root)

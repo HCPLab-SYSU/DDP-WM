@@ -61,7 +61,7 @@ num_proprio_repeat: 1
 num_hist: 3
 num_pred: 1 # only supports 1
 has_predictor: True # set this to False for only training a decoder
-has_decoder: True # set this to False for only training a predictor
+has_decoder: False # set this to False for only training a predictor
 
 model:
   _target_: models.ddp_vwm.DDPVWorldModel
