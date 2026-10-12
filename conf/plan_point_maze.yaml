@@ -1,30 +1,16 @@
 defaults:
   - _self_
-  - override hydra/launcher: submitit_slurm
 
 hydra:
   run:
     dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
-  sweep:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
-    subdir: ${hydra.job.num}
-  launcher:
-    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
-    nodes: 1
-    tasks_per_node: 1
-    cpus_per_task: 16
-    mem_gb: 256
-    gres: "gpu:h100:1"
-    qos: "explore"
-    timeout_min: 720
-    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
-            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
-            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: /path/to/save # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: null
+ckpt_base_path: ./checkpoints  # ${ckpt_base_path}/outputs/${model_name}/checkpoints/model_${model_epoch}.pth
+model_name: ddpwm_point_maze
 model_epoch: latest
+# original DINO-WM PointMaze checkpoint; its image decoder renders predicted features (tools.decode_features)
+feature_decoder_model: ${ckpt_base_path}/outputs/dinowm_point_maze
 
 seed: 99
 n_evals: 50 
@@ -42,7 +28,7 @@ objective:
 
 planner:
   _target_: planning.mpc.MPCPlanner
-  max_iter: null 
+  max_iter: 3 
   n_taken_actions: 5
   sub_planner:
     target: planning.cem.CEMPlanner
@@ -52,4 +38,6 @@ planner:
     var_scale: 1
     opt_steps: 10
     eval_every: 1
+    use_cost_mask: false  # Sparse MPC Cost Mask (planning/cem.py); PointMaze plans with the plain objective
+    mask_dilation: 0  # Sparse MPC Cost Mask dilation: 0 (off), 4 or 8 connectivity
   name: mpc_cem

@@ -66,6 +66,7 @@ class VWorldModel(nn.Module):
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
         self.emb_criterion = nn.MSELoss()
+        # self.decoder=None
 
     def train(self, mode=True):
         super().train(mode)
@@ -122,6 +123,7 @@ class VWorldModel(nn.Module):
         input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
         output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
         """
+        B=obs['visual'].shape[0]
         visual = obs['visual']
         b = visual.shape[0]
         visual = rearrange(visual, "b t ... -> (b t) ...")

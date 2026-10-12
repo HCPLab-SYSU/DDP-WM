@@ -5,6 +5,7 @@ import numpy as np
 from pathlib import Path
 from einops import rearrange
 from decord import VideoReader
+from PIL import Image
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, TrajSlicerDataset
 from typing import Optional, Callable, Any
@@ -28,7 +29,10 @@ class PushTDataset(TrajDataset):
         relative=True,
         action_scale=100.0,
         with_velocity: bool = True, # agent's velocity
-    ):  
+        frame_format: str = "video",  # "video": obses/episode_XXX.mp4, "png": obses_png/episode_XXX/NNNN.png
+    ):
+        assert frame_format in ("video", "png"), frame_format
+        self.frame_format = frame_format
         self.data_path = Path(data_path)
         self.transform = transform
         self.relative = relative
@@ -106,6 +110,8 @@ class PushTDataset(TrajDataset):
         return torch.cat(result, dim=0)
 
     def get_frames(self, idx, frames):
+        if self.frame_format == "png":
+            return self.get_frames_png(idx, frames)
         vid_dir = self.data_path / "obses"
         reader = VideoReader(str(vid_dir / f"episode_{idx:03d}.mp4"), num_threads=1)
         act = self.actions[idx, frames]
@@ -115,6 +121,31 @@ class PushTDataset(TrajDataset):
 
         image = reader.get_batch(frames)  # THWC
         image = image / 255.0
+        image = rearrange(image, "T H W C -> T C H W")
+        if self.transform:
+            image = self.transform(image)
+        obs = {"visual": image, "proprio": proprio}
+        return obs, act, state, {'shape': shape}
+
+    def get_frames_png(self, idx, frames):
+        """Same as get_frames, but reads pre-extracted PNG frames (used for training)."""
+        episode_dir = self.data_path / "obses_png" / f"episode_{idx:03d}"
+        image_list = []
+        for frame_idx in frames:
+            with Image.open(episode_dir / f"{frame_idx:04d}.png") as img:
+                img_np = np.array(img)
+                if img_np.ndim == 2:  # grayscale
+                    img_np = np.expand_dims(img_np, axis=-1)
+                image_list.append(img_np)
+        if not image_list:
+            raise RuntimeError(f"No frames could be loaded for episode {idx} with frame indices.")
+
+        image = torch.from_numpy(np.stack(image_list, axis=0)).float() / 255.0
+        act = self.actions[idx, frames]
+        state = self.states[idx, frames]
+        proprio = self.proprios[idx, frames]
+        shape = self.shapes[idx]
+
         image = rearrange(image, "T H W C -> T C H W")
         if self.transform:
             image = self.transform(image)
@@ -144,6 +175,7 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    frame_format="video",
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -151,6 +183,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/train",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        frame_format=frame_format,
     )
     val_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -158,6 +191,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/val",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        frame_format=frame_format,
     )
 
     num_frames = num_hist + num_pred

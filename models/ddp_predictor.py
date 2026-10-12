@@ -1,556 +1,460 @@
-# file: models/ddp_predictor.py
+"""DDP-WM predictor.
 
-import math
+Training runs in three stages (selected by ``training_stage``):
+
+1. ``localization``: Historical Information Fusion + Dynamic Localization Network. For every patch of
+   the current frame, predict which of its 2x2 sub-patches will change in the next frame (labels come
+   from pixel differences).
+2. ``primary_predictor``: with the stage-1 modules frozen, the localizer picks ``num_motion_tokens``
+   patches and the Sparse Primary Dynamics Predictor predicts their next-frame features.
+3. ``lrm``: starting from a stage-2 model with everything else frozen, the Low-Rank Correction Module
+   updates the remaining background patches from the predicted foreground.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Dict, List, Literal, Optional, Tuple
 
-from .utils import *
 from .vit import ViTPredictor
 
+STAGES = ("localization", "primary_predictor", "lrm")
 
-# ====================================================================
-#  Stage 1: HistoricalInformationFusionModule (Historical Information Fusion)
-# ====================================================================
-class HistoricalInformationFusion(nn.Module):
-    """
-    paper Stage 1: Historical Information Fusion Module.
-    Use a single layer of Cross-Attention the history frame information (Z_hist) fuse into the current frame (z_t) in.
-    """
-    def __init__(self, d_model, n_heads, dropout=0.1, num_frames=3, num_patches=196):
+PATCH_GRID = 14  # DINOv2 patch grid is PATCH_GRID x PATCH_GRID
+NUM_PATCHES = PATCH_GRID * PATCH_GRID
+MOTION_THRESHOLD = 0.1  # pixel RMS difference above which a (sub-)patch counts as changing
+CLS_POS_WEIGHT = 10.0  # positive-class weight of the localization BCE loss
+
+
+class MLP(nn.Module):
+    """Simple multi-layer perceptron with ReLU activations."""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
-        # Instantiate the cross-attention layer
-        self.history_encoder = CrossAttentionDecoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=False,
-            normalize_before=False
-        )
-        
-        # Instantiate position encoding parameters (These were originally in Predictor 's __init__ in)
-        self.hist_query_pos = nn.Parameter(torch.randn(num_patches, d_model))
-        self.hist_mem_pos = nn.Parameter(torch.randn(num_patches, d_model))
-        if num_frames > 1:
-            self.hist_time_embeds = nn.Parameter(torch.zeros(num_frames - 1, d_model))
-        else:
-            self.hist_time_embeds = None
+        h = [hidden_dim] * (num_layers - 1)
+        layers = []
+        for n, k in zip([input_dim] + h, h + [output_dim]):
+            layers.append(nn.Linear(n, k))
+            layers.append(nn.ReLU(inplace=True))
+        layers.pop()  # no activation after the last layer
+        self.layers = nn.Sequential(*layers)
 
-    def forward(self, z_history: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z_history (torch.Tensor): the input history sequence, shape [B, T, N, D].
-                                      the last frame is the current frame t, preceded by history frames.
-
-        Returns:
-            torch.Tensor: current frame features after fusing history information z_t', shape [B, 1, N, D].
-        """
-        B, t_len, N, D = z_history.shape
-
-        if t_len <= 1:
-            # If there is no history information, return the current frame directly, but ensure the computation graph can pass(for gradient checking)
-            if self.hist_time_embeds is not None:
-                # This is a trick, Ensure that even without history frames, these parameters are also included in the computation graph
-                # Their gradients will be0, but it won't cause an error for being unused
-                dummy_sum = sum(p.sum() for p in self.history_encoder.parameters()) * 0 + \
-                            self.hist_query_pos.sum() * 0 + \
-                            self.hist_mem_pos.sum() * 0 + \
-                            self.hist_time_embeds.sum() * 0
-                return z_history + dummy_sum
-            return z_history
-
-        # prepare Query: current_frame
-        current_frame = z_history[:, -1, :, :].permute(1, 0, 2)  # (N, B, D)
-        query_pos = self.hist_query_pos.unsqueeze(1).repeat(1, B, 1) # (N, B, D)
-        
-        # prepare Key/Value: history_frame
-        history_frames = rearrange(z_history[:, :-1, :, :], 'b t n d -> (t n) b d') # ((t-1)*N, B, D)
-        
-        # prepare Key/Value 's position encoding
-        hist_len = t_len - 1
-        mem_pos_spatial = self.hist_mem_pos.unsqueeze(0).repeat(hist_len, 1, 1) # (t-1, N, D)
-        
-        if self.hist_time_embeds is not None:
-            time_pe = self.hist_time_embeds[:hist_len].unsqueeze(1)
-            mem_pos_full = mem_pos_spatial + time_pe
-        else:
-            mem_pos_full = mem_pos_spatial
-        
-        mem_pos = rearrange(mem_pos_full, 't n d -> (t n) d').unsqueeze(1).repeat(1, B, 1) # ((t-1)*N, B, D)
-
-        # Execute cross-attention, with an internal residual connection
-        encoded_frame = self.history_encoder(
-            tgt=current_frame,
-            memory=history_frames,
-            query_pos=query_pos,
-            pos=mem_pos
-        )  # (N, B, D)
-        
-        # Restore dimensions and return
-        z_t_prime = encoded_frame.permute(1, 0, 2).unsqueeze(1) # [B, 1, N, D]
-        
-        return z_t_prime
+    def forward(self, x):
+        return self.layers(x)
 
 
-# ====================================================================
-#  Stage 2: DynamicLocalizationNetwork (Dynamic Localization Network)
-# ====================================================================
-class DynamicLocalizationNetwork(nn.Module):
-    """
-    paper Stage 2: Dynamic Localization Network.
-    A lightweight ViT, receives the fused z_t' and action, predict the changed region mask M.
-    """
-    def __init__(self, d_visual, d_action_embed, d_proprio_embed, 
-                 reduced_dim, num_layers, n_heads, mlp_dim, n_patches_hw, partition_precision, **kwargs):
+class CrossAttentionDecoderLayer(nn.Module):
+    """Post-norm cross-attention block: tgt attends to memory. Inputs are (L, B, D)."""
+
+    def __init__(self, d_model, nhead, dropout=0.1):
         super().__init__()
-        self.n_patches_hw = n_patches_hw
-        
-        self.dimensionality_reduction_layer = nn.Linear(d_visual, reduced_dim)
-        
-        dino_wm_ti_dim = reduced_dim + d_action_embed + d_proprio_embed
-        self.dino_wm_ti = ViTPredictor(
-            dim=dino_wm_ti_dim, 
-            depth=num_layers, 
-            heads=n_heads, 
-            mlp_dim=mlp_dim,
-            num_frames=1, 
-            num_patches=n_patches_hw[0] * n_patches_hw[1]
-        )
-        
-        # Determine output dimension based on configuration
-        self.cls_head = MLP(dino_wm_ti_dim, dino_wm_ti_dim, partition_precision, num_layers=3)
-
-    def forward(self, z_t_prime_vis: torch.Tensor, z_t_prime_prio: torch.Tensor, z_t_prime_act: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z_t_prime_vis (torch.Tensor): visual part, shape [B, 1, N, D_vis]
-            z_t_prime_prio (torch.Tensor): proprioceptive part, shape [B, 1, N, D_prio]
-            z_t_prime_act (torch.Tensor): action part, shape [B, 1, N, D_act]
-        
-        Returns:
-            torch.Tensor: mask's logits, shape [B, N*4] or [B, N]
-        """
-        # as prio and act expand patch dimension
-        B, _, N, _ = z_t_prime_vis.shape
-
-        # Dimensionality reduction and concatenation
-        z_vis_reduction = self.dimensionality_reduction_layer(z_t_prime_vis)
-        z_reduction = torch.cat([z_vis_reduction, z_t_prime_prio, z_t_prime_act], dim=-1)
-        
-        # ViT Adjust input format
-        z_reduction = rearrange(z_reduction, "b t p d -> b (t p) d")
-        
-        # through ViT and classification head
-        z_reduction = self.dino_wm_ti(z_reduction)
-        logits = self.cls_head(z_reduction)
-        
-        return logits
-
-
-
-# ====================================================================
-#  Stage 3: SparsePrimaryDynamicsPredictor (Sparse Primary Dynamics Predictor)
-# ====================================================================
-class SparsePrimaryDynamicsPredictor(nn.Module):
-    """
-    paper Stage 3: Sparse Primary Dynamics Predictor.
-    A powerful Transformer, on the localized sparse foreground token perform self-attention on.
-    """
-    def __init__(self, d_model, num_layers, n_heads, mlp_dim, **kwargs):
-        super().__init__()
-        # Used here ViTPredictor, because it is essentially a token operating on the sequence Transformer
-        self.dino_wm = ViTPredictor(
-            dim=d_model, 
-            depth=num_layers, 
-            heads=n_heads, 
-            mlp_dim=mlp_dim,
-            num_frames=1, # Only process the foreground of a single frame
-            num_patches=196 
-        )
-
-    def forward(self, z_t_prime: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z_t_prime (torch.Tensor): fused current frame, shape [B, 1, N, D_model].
-            mask (torch.Tensor): boolean mask, shape [B, N], True represents foreground.
-
-        Returns:
-            torch.Tensor: the predicted foreground features of the next frame, shape [B, K, D_model].
-        """
-        B, _, N, D = z_t_prime.shape
-        z_t_prime = z_t_prime.squeeze(1)
-
-        # Perform self-attention through the primary predictor
-        # dino_wm input [B, N, D], output [B, K, D]
-        next_fg_tokens = self.dino_wm(z_t_prime, mask)
-   
-        return next_fg_tokens
-
-        
-# ====================================================================
-#  Stage 4: LowRankCorrectionModule (LRM / Low-Rank Correction Module)
-# ====================================================================
-class LowRankCorrectionModule(nn.Module):
-    """
-    paper Stage 4: Low-Rank Correction Module (LRM).
-
-    This module is responsible for efficiently updating background features.Its core mechanism is:
-    1. background token as Query.
-    2. the updated foreground token as Key and Value.
-    3. Through a single cross-attention layer, Let each background token "query" changes in the foreground, and adjust itself accordingly.
-    4. Use Absolute Position Encoding (APE) as Query and Key/Value provide spatial information.
-    """
-    def __init__(self, d_model: int, n_heads: int, n_patches: int, dropout: float = 0.0):
-        """
-        initialize LRM module.
-
-        Args:
-            d_model (int): The feature dimension of the model.
-            n_heads (int): The number of heads for multi-head attention.
-            n_patches (int): patch 's total count (for example 14*14=196).
-            dropout (float): Dropout 's probability.
-        """
-        super().__init__()
-        self.d_model = d_model
-        self.n_patches = n_patches
-
-        # 1. Directly instantiate the cross-attention layer
-        self.cross_attn = CrossAttentionDecoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=False,  # PyTorch Transformerlayer expects by default (L, B, D)
-            normalize_before=False
-        )
-
-        # 2. Create learnable Absolute Position Encoding (APE)
-        #    thisAPEwill be used for all 196  patch provide position information
-        self.ape = nn.Parameter(torch.randn(n_patches, d_model))
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
 
     @staticmethod
-    def _mask_to_indices(mem_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        A static helper function, convert a boolean mask into foreground and background indices.
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
 
-        Args:
-            mem_mask (torch.Tensor): foreground mask, shape [B, N], Truerepresents foreground.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (foreground index, background index).
-        """
-        B, N = mem_mask.shape
-        device = mem_mask.device
-        
-        # Create a grid containing all position indices
-        pos = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
-
-        # Separate indices based on the mask
-        idx_mem = pos[mem_mask].view(B, -1)     # (B, K)
-        idx_tgt = pos[~mem_mask].view(B, -1)   # (B, N-K)
-        
-        return idx_mem, idx_tgt
-
-    def forward(self, z_t_prime: torch.Tensor, mask: torch.Tensor, pred_fg_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        execute LRM 's forward propagation.
-
-        Args:
-            z_t_prime (torch.Tensor): fused current frame features, shape [B, N, D].
-            mask (torch.Tensor): boolean mask, shape [B, N], True represents foreground.
-            pred_fg_tokens (torch.Tensor): the predicted foreground features of the next frame, shape [B, K, D].
-
-        Returns:
-            torch.Tensor: updated next-frame background features, shape [B, N-K, D].
-        """
-        B, N, D = z_t_prime.shape
-        K = pred_fg_tokens.shape[1]
-        num_bg = N - K
-        
-        # 1. Extract original background token (as Query)
-        bg_tokens = z_t_prime[~mask].view(B, num_bg, D)
-        
-        # 2. Prepare inputs for cross-attention (tgt, memory, pos, query_pos)
-        
-        # 2a. Get foreground and background indices
-        idx_mem, idx_tgt = self._mask_to_indices(mask)
-        
-        # 2b. Assign position encodings
-        #    - `pos` is memory (foreground) 's position encoding
-        #    - `query_pos` is tgt (background) 's position encoding
-        ape_mem = self.ape.index_select(0, idx_mem.reshape(-1)).view(B, K, D)
-        ape_bg = self.ape.index_select(0, idx_tgt.reshape(-1)).view(B, num_bg, D)
-        
-        # 2c. Adjust dimensions to match PyTorch Transformer API (L, B, D)
-        # Query (background)
-        tgt = bg_tokens.transpose(0, 1)          # (N-K, B, D)
-        query_pos = ape_bg.transpose(0, 1)       # (N-K, B, D)
-        
-        # Key/Value (foreground)
-        memory = pred_fg_tokens.transpose(0, 1)  # (K, B, D)
-        pos = ape_mem.transpose(0, 1)            # (K, B, D)
-        
-        # 3. Execute cross-attention
-        #    background(tgt)query foreground(memory)
-        updated_bg_tokens_transposed = self.cross_attn(
-            tgt=tgt,
-            memory=memory,
-            pos=pos,
-            query_pos=query_pos
-        )
-        
-        # 4. Restore dimensions to (B, N-K, D) and return
-        updated_bg_tokens = updated_bg_tokens_transposed.transpose(0, 1)
-        
-        return updated_bg_tokens
+    def forward(self, tgt, memory, pos=None, query_pos=None):
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+        )[0]
+        tgt = tgt + self.dropout2(tgt2)
+        return self.norm2(tgt)
 
 
-# ====================================================================
-#  Final Assembly: DDP-WM predictor
-# ====================================================================
-class DDP_Predictor(nn.Module):
-    """
-    complete DDP-WM predictor, Supports staged initialization and training.
-    through `training_stage` parameter controls the instantiation and forward propagation logic of the module.
-    """
-    def __init__(self, d_visual, d_action_embed, d_proprio_embed, num_frames, num_patches, 
-                 training_stage: str = 'inference', **kwargs):
-        """
-        Args:
-            training_stage (str): training stage, optional_values:
-                - 'localization': Train only history fusion and localization network.
-                - 'primary_predictor': Train the Primary Dynamics Predictor (Freeze preceding modules).
-                - 'lrm': Train the Low-Rank Correction Module (Freeze preceding modules).
-                - 'inference': inference mode, All modules are loaded and frozen.
-        """
+class TransformerDecoderLayer(nn.Module):
+    """Post-norm DETR decoder layer: self-attention over the queries, then cross-attention to memory."""
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        
-        # --- 1. Save core configuration ---
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward(self, tgt, memory, pos=None, query_pos=None):
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt = self.norm1(tgt + self.dropout1(self.self_attn(q, k, value=tgt)[0]))
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+        )[0]
+        tgt = self.norm2(tgt + self.dropout2(tgt2))
+        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
+        return self.norm3(tgt + self.dropout3(tgt2))
+
+
+# ====================================================================
+#  Historical Information Fusion Module
+# ====================================================================
+class HistoricalInformationFusion(nn.Module):
+    """Cross-attention from the current frame to the previous num_frames - 1 frames."""
+
+    def __init__(self, d_model, num_frames, n_heads=4, dropout=0.1):
+        super().__init__()
+        self.history_encoder = CrossAttentionDecoderLayer(d_model=d_model, nhead=n_heads, dropout=dropout)
+        self.hist_query_pos = nn.Parameter(torch.randn(NUM_PATCHES, d_model))
+        self.hist_mem_pos = nn.Parameter(torch.randn(NUM_PATCHES, d_model))
+        self.hist_time_embeds = nn.Parameter(torch.zeros(num_frames - 1, d_model))
+
+    def forward(self, z):
+        """(B, T, N, D) -> (B, 1, N, D). With a single frame the input is returned unchanged
+        (plus zero-valued terms so that every parameter stays in the autograd graph)."""
+        B, t_len = z.shape[:2]
+        if t_len > 1:
+            current_frame = z[:, -1].permute(1, 0, 2)  # (N, B, D)
+            history_frames = rearrange(z[:, :-1], "b t n d -> (t n) b d")
+            query_pos = self.hist_query_pos.unsqueeze(1).repeat(1, B, 1)
+            mem_pos = self.hist_mem_pos.unsqueeze(0).repeat(t_len - 1, 1, 1)
+            mem_pos = mem_pos + self.hist_time_embeds[: t_len - 1].unsqueeze(1)
+            mem_pos = rearrange(mem_pos, "t n d -> (t n) d").unsqueeze(1).repeat(1, B, 1)
+            encoded = self.history_encoder(tgt=current_frame, memory=history_frames, query_pos=query_pos, pos=mem_pos)
+            return encoded.permute(1, 0, 2).unsqueeze(1)
+        dummy_out = self.history_encoder(z[:1, 0, :1], z[:1, 0, :1])
+        return (
+            z
+            + self.hist_time_embeds.sum() * 0
+            + self.hist_query_pos.sum() * 0
+            + self.hist_mem_pos.sum() * 0
+            + dummy_out.sum() * 0
+        )
+
+
+# ====================================================================
+#  Dynamic Localization Network
+# ====================================================================
+class DynamicLocalizationNetwork(nn.Module):
+    """Small ViT over reduced visual features; outputs 4 logits (2x2 sub-patches) per patch.
+
+    Once frozen (stages 2 and 3) it stays in eval mode.
+    """
+
+    def __init__(self, d_visual, d_other, reduced_dim=192, num_layers=6, n_heads=3, mlp_dim=768, dropout=0.1):
+        super().__init__()
         self.d_visual = d_visual
-        self.d_proprio = d_proprio_embed
-        self.d_action = d_action_embed
-        self.training_stage = training_stage
-        
-        d_model = d_visual + d_action_embed + d_proprio_embed
-        n_patches_hw = (int(num_patches**0.5), int(num_patches**0.5))
+        dim = reduced_dim + d_other
+        self.dino_wm_ti = ViTPredictor(
+            dim=dim, depth=num_layers, heads=n_heads, mlp_dim=mlp_dim,
+            num_frames=1, num_patches=NUM_PATCHES, dropout=dropout, emb_dropout=0, pool="mean",
+        )
+        self.dimensionality_reduction_layer = nn.Linear(d_visual, reduced_dim)
+        self.cls_head = MLP(dim, dim, 4, num_layers=3)
+        self.frozen = False
 
-        # --- 2. According to the training stage, Conditionally initialize modules as needed ---
-        
-        # All modules are by default None
-        self.history_fusion: Optional[HistoricalInformationFusion] = None
-        self.localizer: Optional[DynamicLocalizationNetwork] = None
-        self.primary_predictor: Optional[SparsePrimaryDynamicsPredictor] = None
-        self.lrm: Optional[LowRankCorrectionModule] = None
-        self.delta_head: Optional[MLP] = None
-        
-        print(f"Initializing DDP_Predictor in '{self.training_stage}' stage.")
+    def train(self, mode=True):
+        return super().train(mode and not self.frozen)
 
-        # Stage 1 & 2: Always required or as a dependency
-        if self.training_stage in ['localization', 'primary_predictor', 'lrm', 'inference']:
-            self.history_fusion = HistoricalInformationFusion(
-                d_model=d_model, num_frames=num_frames, num_patches=num_patches, **kwargs['history_fusion']
-            )
-            self.localizer = DynamicLocalizationNetwork(
-                d_visual=d_visual, d_action_embed=d_action_embed, d_proprio_embed=d_proprio_embed,
-                n_patches_hw=n_patches_hw, **kwargs['localizer']
-            )
+    def forward(self, z):
+        """(B, 1, N, D) -> (B, N, 4) logits."""
+        z_reduced = torch.cat([self.dimensionality_reduction_layer(z[..., : self.d_visual]), z[..., self.d_visual :]], dim=-1)
+        z_reduced = rearrange(z_reduced, "b t p d -> b (t p) d")
+        return self.cls_head(self.dino_wm_ti(z_reduced))
 
-        # Stage 3: at 'primary_predictor' and subsequent stages require
-        if self.training_stage in ['primary_predictor', 'lrm', 'inference']:
-            self.primary_predictor = SparsePrimaryDynamicsPredictor(
-                d_model=d_model, **kwargs['primary_predictor']
-            )
-        
-        # Stage 4: at 'lrm' and subsequent stages require
-        if self.training_stage in ['lrm', 'inference']:
-            self.lrm = LowRankCorrectionModule(
-                d_model=d_model, n_patches=num_patches, **kwargs['lrm']
-            )
-        
-        # --- 3. Freeze pre-trained modules according to the stage ---
-        self._freeze_stages()
 
-    def _freeze_stages(self):
-        """According to the current training stage, Freeze modules that do not need to be trained."""
-        if self.training_stage == 'primary_predictor':
-            print("Freezing modules for 'primary_predictor' stage...")
-            freeze_module(self.history_fusion)
-            freeze_module(self.localizer)
-        
-        elif self.training_stage == 'lrm':
-            print("Freezing modules for 'lrm' stage...")
-            freeze_module(self.history_fusion)
-            freeze_module(self.localizer)
-            freeze_module(self.primary_predictor)
+# ====================================================================
+#  Sparse Primary Dynamics Predictor
+# ====================================================================
+class SparsePrimaryDynamicsPredictor(nn.Module):
+    """ViT over the selected foreground tokens; predicts their next-frame features."""
 
-        elif self.training_stage == 'inference':
-            print("Freezing all modules for 'inference' stage.")
-            freeze_module(self) # Freeze all its own parameters
+    def __init__(self, d_model, num_layers=6, n_heads=16, mlp_dim=2048, dropout=0.1):
+        super().__init__()
+        self.dino_wm = ViTPredictor(
+            dim=d_model, depth=num_layers, heads=n_heads, mlp_dim=mlp_dim, num_frames=1,
+            num_patches=NUM_PATCHES, dropout=dropout, emb_dropout=0, pool="mean",
+        )
 
-    def _process_mask(self, mask_logits: torch.Tensor) -> torch.Tensor:
-        """Internal helper function, used tologitsconvert to the final binarized mask."""
-        mask = (mask_logits.sigmoid() > 0.5)
-        if len(mask.shape) == 3: # Handle multi-class output cases
-            mask = mask.sum(-1) > 0
-        # mask = dilate_mask(mask, connectivity=connectivity)
-        mask = force_fixed_k_mask(mask)
+    def forward(self, x, mask):
+        """x: (B, N, D), mask: (B, N) bool with k Trues per row -> (B, k, D)."""
+        return self.dino_wm(x, mask)
+
+
+# ====================================================================
+#  Low-Rank Correction Module (LRM)
+# ====================================================================
+class LowRankCorrectionModule(nn.Module):
+    """Cross-attention from the background patches to the predicted foreground patches.
+
+    Holds a learnable absolute position embedding for all patches; ``mem_mask`` marks the
+    foreground patches (exactly k per row) and decides which embeddings go to memory and target.
+    """
+
+    def __init__(self, d_model, n_heads=4, dropout=0.0, n_patches=NUM_PATCHES):
+        super().__init__()
+        self.n_patches = n_patches
+        self.d_model = d_model
+        self.ape = nn.Parameter(torch.randn(n_patches, d_model))
+        self.cross_attn = CrossAttentionDecoderLayer(d_model=d_model, nhead=n_heads, dropout=dropout)
+
+    @staticmethod
+    def mask_to_indices(mem_mask):
+        """(B, N) mask with the same number of Trues per row -> sorted (B, k) and (B, N-k) indices."""
+        if mem_mask.dtype != torch.bool:
+            mem_mask = mem_mask > 0.5
+        B, N = mem_mask.shape
+        pos = torch.arange(N, device=mem_mask.device).unsqueeze(0).expand(B, -1)
+        return pos[mem_mask].view(B, -1), pos[~mem_mask].view(B, -1)
+
+    def forward(self, tgt_tokens, mem_tokens, mem_mask):
+        """tgt_tokens: (B, N-k, D), mem_tokens: (B, k, D), mem_mask: (B, N) -> (B, N-k, D)."""
+        B, n_tgt, D = tgt_tokens.shape
+        k = mem_tokens.shape[1]
+        idx_mem, idx_tgt = self.mask_to_indices(mem_mask)
+        if idx_mem.shape[1] != k or idx_tgt.shape[1] != n_tgt:
+            raise ValueError(f"mask selects {idx_mem.shape[1]} tokens, expected {k}")
+        ape_mem = self.ape.index_select(0, idx_mem.reshape(-1)).view(B, k, D)
+        ape_tgt = self.ape.index_select(0, idx_tgt.reshape(-1)).view(B, n_tgt, D)
+        out = self.cross_attn(
+            tgt=tgt_tokens.transpose(0, 1),
+            memory=mem_tokens.transpose(0, 1),
+            pos=ape_mem.transpose(0, 1),
+            query_pos=ape_tgt.transpose(0, 1),
+        )
+        return out.transpose(0, 1)
+
+
+def dilate_mask(mask, connectivity):
+    """Dilate a (B, 196) patch mask on the 14x14 grid; connectivity 0 returns it unchanged."""
+    if connectivity not in (4, 8):
         return mask
+    b, n = mask.shape
+    assert n == NUM_PATCHES, f"Expected {NUM_PATCHES} patches, got {n}"
+    if connectivity == 4:
+        kernel = [[0, 1, 0], [1, 1, 1], [0, 1, 0]]
+    else:
+        kernel = [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+    kernel = torch.tensor(kernel, dtype=mask.dtype, device=mask.device).view(1, 1, 3, 3)
+    dilated = F.conv2d(mask.view(b, 1, PATCH_GRID, PATCH_GRID), kernel, padding=1) > 0
+    return dilated.float().view(b, n)
 
-    def forward(self, z_history: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        executed in stagesDDP-WMforward propagation.
-        according to `self.training_stage` return different intermediate results.
-        """
-        # --- Stage 1: History Fusion ---
-        # This step is always needed, even if it is primary_predictor stage, also needs it as no_grad 's input
-        with torch.no_grad() if self.training_stage not in ['localization'] else torch.enable_grad():
-            z_t_prime_full = self.history_fusion(z_history) # [B, 1, N, D]
-        
-        # --- Stage 2: Dynamic Localization ---
-        with torch.no_grad() if self.training_stage not in ['localization'] else torch.enable_grad():
-            z_vis = z_t_prime_full[..., :self.d_visual]
-            z_prio = z_t_prime_full[..., self.d_visual : self.d_visual + self.d_proprio]
-            z_act = z_t_prime_full[..., -self.d_action:]
-            mask_logits = self.localizer(z_vis, z_prio, z_act)
-        
-        if self.training_stage == 'localization':
-            return {'mask_logits': mask_logits}
 
-        # --- Stage 3: Sparse Primary Dynamics Prediction ---
-        with torch.no_grad() if self.training_stage not in ['primary_predictor'] else torch.enable_grad():
-            mask = self._process_mask(mask_logits)
-            pred_fg_tokens = self.primary_predictor(z_t_prime_full, mask)
-        
-        if self.training_stage == 'primary_predictor':
-            return {'pred_fg': pred_fg_tokens, 'mask': mask}
+def force_fixed_k_mask(mask, k):
+    """Return a (B, N) bool mask with exactly k Trues per row.
 
-        # --- Stage 4: Low-Rank Correction ---
-        with torch.no_grad() if self.training_stage not in ['lrm'] else torch.enable_grad():
-            updated_bg_tokens = self.lrm(z_t_prime_full.squeeze(1), mask, pred_fg_tokens)
-
-        if self.training_stage == 'lrm':
-            return {'pred_bg': updated_bg_tokens, 'mask': mask}
-        
-        # --- Combine foreground and background, form the next frame ---
-        z_t_plus_1 = torch.zeros_like(z_history[:,-1])
-        z_t_plus_1[mask] = pred_fg_tokens.view(-1, z_t_prime_full.size(-1))
-        z_t_plus_1[~mask] = updated_bg_tokens.view(-1, z_t_prime_full.size(-1))
-
-        # --- Inference stage ---
-        return {'final_prediction': z_t_plus_1.unsqueeze(1)}
-
+    Higher mask values are kept first; ties are broken randomly, and if fewer than k entries
+    are positive the rest is filled with random patches.
+    """
+    B, N = mask.shape
+    if N < k:
+        raise ValueError(f"Number of patches N={N} must be >= k={k}")
+    scores = mask.float() * 2.0 + torch.rand(B, N, device=mask.device)
+    _, indices = torch.topk(scores, k, dim=1)
+    new_mask = torch.zeros_like(mask, dtype=torch.bool)
+    new_mask.scatter_(1, indices, True)
+    return new_mask
 
 
 class LabelGenerator(nn.Module):
-    """
-    A module specifically for generating binarized foreground masks from raw data during training.
+    """Builds change masks and training targets for a pair of frames (no parameters)."""
 
-    This module, based on the specified mode ('pixel' or 'feature') calculate the change between consecutive frames, 
-    Apply threshold, finally generate a
-    clean、for supervising downstream tasks(like localization、segmentation)'s boolean mask.
-
-    It does not participate in the model's inference process.
-
-    Args:
-        mode (str): 'pixel' or 'feature'.Determines whether to generate the mask based on pixel difference or feature difference.
-        pixel_threshold (float): at 'pixel' in mode, The pixel difference norm threshold used to determine significant changes.
-        feature_threshold (float): at 'feature' in mode, The feature difference norm threshold used to determine significant changes.
-        d_feature (int): at 'feature' in mode, The feature dimension used to calculate the norm.
-        grid_h (int): feature_map/of the mask in the height direction patch count.
-        grid_w (int): feature_map/of the mask in the width direction patch count.
-    """
-    def __init__(self,
-                 mode: Literal['pixel', 'feature'] = 'pixel',
-                 pixel_threshold: float = 0.1,
-                 feature_threshold: float = 45.0,
-                 d_feature: int = 384,
-                 grid_h: int = 14,
-                 grid_w: int = 14,
-                 partition_precision: int = 4,
-                 **kwargs): # Absorb extra configuration parameters
+    def __init__(self, training_stage, mask_dilation, num_motion_tokens, d_state, threshold=MOTION_THRESHOLD):
         super().__init__()
+        self.training_stage = training_stage
+        self.mask_dilation = mask_dilation
+        self.num_motion_tokens = num_motion_tokens
+        self.d_state = d_state
+        self.threshold = threshold
 
-        assert mode in ['pixel', 'feature'], "mode must be 'pixel' or 'feature'"
-        
-        self.mode = mode
-        self.pixel_threshold = pixel_threshold
-        self.feature_threshold = feature_threshold
-        self.d_feature = d_feature
-        self.grid_h = grid_h
-        self.grid_w = grid_w
-        self.n_patches = grid_h * grid_w
-        self.partition_precision = partition_precision
+    def pixel_motion_mask(self, frames):
+        """frames: (B, 2, C, H, W) -> (B, 1, G*G) float mask of patches whose RMS pixel change exceeds the threshold.
 
-        # set the module to evaluation mode and freeze it, because it does not contain trainable parameters
+        G is the patch grid (14), or twice that in stage 1 where the localizer predicts 2x2 sub-patches.
+        """
+        B = frames.shape[0]
+        pixel_diff = (frames[:, 1:] - frames[:, :-1]).flatten(0, 1)  # (B, C, H, W)
+        H, W = pixel_diff.shape[-2:]
+        patch_h, patch_w = H // PATCH_GRID, W // PATCH_GRID
+        if self.training_stage == "localization":
+            patch_h, patch_w = patch_h // 2, patch_w // 2
+        pixel_norms_sq = torch.sum(pixel_diff * pixel_diff, dim=1, keepdim=True)
+        mean_sq_norms = F.avg_pool2d(pixel_norms_sq, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
+        norms = torch.sqrt(mean_sq_norms.view(B, 1, -1))
+        return (norms > self.threshold).float()
+
+    def select_tokens(self, mask):
+        """(B, 1, N) change scores -> (B, 1, N) bool mask with exactly num_motion_tokens Trues."""
+        mask = dilate_mask(mask.squeeze(1), connectivity=self.mask_dilation)
+        return force_fixed_k_mask(mask, self.num_motion_tokens).unsqueeze(1)
+
+    def forward(self, z, frames, pred_mask=None):
+        """
+        z: (B, 2, N, E) features of frames t and t+1; frames: (B, 2, C, H, W).
+        pred_mask: optional (B, 1, N) change scores from the frozen localizer (stages 2 and 3).
+        Returns (targets, mask):
+          stage 1:    targets is None, mask is the (B, 1, 4N) sub-patch label;
+          stage 2/3:  mask is the (B, 1, N) bool token selection, targets are the (B, 1, N, d_state)
+                      next-frame features (zeroed outside the selection in stage 2).
+        """
+        mask = self.pixel_motion_mask(frames) if pred_mask is None else pred_mask
+        if self.training_stage == "localization":
+            return None, mask
+        mask = self.select_tokens(mask)
+        targets = z[:, 1:, :, : self.d_state]
+        if self.training_stage == "primary_predictor":
+            targets = targets * mask.unsqueeze(-1)
+        return targets, mask
+
+
+class _QueryDecoderMixin:
+    """DETR-style query decoder the DDP-WM predictors are derived from: learnable queries attend to the patch
+    features and a cross-attention layer decodes them back onto the patch grid.
+    """
+
+    def _build_query_decoder(self, d_model, d_visual, d_out, num_queries, coord_and_delta_heads, sub_patch_head):
+        self.query_embed = nn.Parameter(torch.randn(num_queries, d_model))
+        self.decoder_layers = nn.ModuleList(
+            [TransformerDecoderLayer(d_model, nhead=4, dim_feedforward=2048, dropout=0.1) for _ in range(6)]
+        )
+        self.cls_head = MLP(d_model, d_model, 1, num_layers=3)
+        if coord_and_delta_heads:
+            self.coord_head = MLP(d_model, d_model, 2, num_layers=3)
+            self.delta_head = nn.Linear(d_model, d_out)
+        if sub_patch_head:
+            self.cls_head = MLP(d_model, d_model, 4, num_layers=3)
+        dense_pos = torch.cat([torch.randn(NUM_PATCHES, d_visual), torch.zeros(NUM_PATCHES, d_model - d_visual)], dim=-1)
+        self.register_buffer("dense_query_pos", dense_pos)
+        self.dense_decoder = CrossAttentionDecoderLayer(d_model=d_model, nhead=4, dropout=0.1)
+
+    def _drop_query_decoder(self):
+        for name in ("query_embed", "decoder_layers", "cls_head", "coord_head", "delta_head", "dense_query_pos", "dense_decoder"):
+            if hasattr(self, name):
+                delattr(self, name)
+
+
+class FrozenLocalizer(_QueryDecoderMixin, nn.Module):
+    """Frozen stage-1 modules (history fusion + localizer) used in stages 2 and 3 to choose the foreground tokens.
+
+    Loads them from the ``history_fusion.*`` / ``localizer.*`` predictor keys of ``ckpt_path`` (a stage-1
+    checkpoint, or any later checkpoint, which carries them too) and keeps the full checkpoint in
+    ``checkpoint`` so that the world model can also take the proprio/action encoders from it.
+    """
+
+    def __init__(
+        self, ckpt_path, use_history, num_queries=32, d_visual=384, d_action_embed=10, d_proprio_embed=10, num_frames=3
+    ):
+        super().__init__()
+        self.use_history = use_history
+        d_model = d_visual + d_action_embed + d_proprio_embed
+        self._build_query_decoder(
+            d_model, d_visual, d_visual + d_proprio_embed, num_queries, coord_and_delta_heads=False, sub_patch_head=True
+        )
+        if use_history and num_frames > 1:
+            self.history_fusion = HistoricalInformationFusion(d_model, num_frames)
+        self.localizer = DynamicLocalizationNetwork(d_visual, d_action_embed + d_proprio_embed)
+        self._drop_query_decoder()
+
+        self.checkpoint = torch.load(ckpt_path, map_location="cpu")
+        missing, _ = self.load_state_dict(self.checkpoint["predictor"], strict=False)
+        if missing:
+            raise ValueError(f"{ckpt_path} has no localizer weights: missing {missing}")
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
+        self.localizer.frozen = True
 
-    @torch.no_grad()
-    def forward(self, 
-                images_dict: Dict[str, torch.Tensor],
-                z_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def train(self, mode=True):
+        """Always stays in eval mode."""
+        return super().train(False)
+
+    def forward(self, z):
+        """z: (B, T, N, D) history -> (B, N) number of changing sub-patches (0..4) per patch."""
+        if self.use_history:
+            z = self.history_fusion(z)
+        logits = self.localizer(z)
+        return (logits.sigmoid() > 0.5).sum(-1).float()
+
+
+class DDP_Predictor(_QueryDecoderMixin, nn.Module):
+    """DDP-WM predictor for all three training stages.
+
+    localization:       history fusion + localizer, returns (B, 4N) sub-patch logits.
+    primary_predictor:  ViT over the selected foreground tokens, returns (B, N, d_visual + d_proprio)
+                        next-frame features (zero outside the selection).
+    lrm:                primary_predictor plus the LRM for the background patches; ``init_ckpt`` (a stage-2
+                        checkpoint) is loaded and everything except ``lrm`` is frozen.
+    In stages 2/3 the frozen history fusion and localizer are attached by the world model.
+    Extra keyword arguments from the hydra config are accepted and ignored.
+    """
+
+    def __init__(
+        self,
+        d_visual=384,
+        d_action_embed=10,
+        d_proprio_embed=10,
+        num_frames=3,
+        training_stage="lrm",
+        use_history=True,
+        init_ckpt=None,
+        num_queries=32,
+        **unused,
+    ):
+        super().__init__()
+        assert training_stage in STAGES, f"training_stage must be one of {STAGES}"
+        self.training_stage = training_stage
+        self.use_history = use_history
+        self.d_visual = d_visual
+        self.d_proprio_embed = d_proprio_embed
+        d_model = d_visual + d_action_embed + d_proprio_embed
+        self._build_query_decoder(
+            d_model, d_visual, d_visual + d_proprio_embed, num_queries,
+            coord_and_delta_heads=True, sub_patch_head=(training_stage == "localization"),
+        )
+
+        if training_stage == "localization":
+            if use_history and num_frames > 1:
+                self.history_fusion = HistoricalInformationFusion(d_model, num_frames)
+            self.localizer = DynamicLocalizationNetwork(d_visual, d_action_embed + d_proprio_embed)
+            self._drop_query_decoder()
+            return
+
+        self.primary_predictor = SparsePrimaryDynamicsPredictor(d_model)
+        self._drop_query_decoder()
+        if training_stage == "lrm":
+            if init_ckpt is not None:
+                self.load_state_dict(torch.load(init_ckpt, map_location="cpu")["predictor"], strict=False)
+            self.lrm = LowRankCorrectionModule(d_model=d_model, n_patches=NUM_PATCHES)
+            for p in self.parameters():
+                p.requires_grad = False
+            for p in self.lrm.parameters():
+                p.requires_grad = True
+            self.primary_predictor.eval()
+
+    def forward(self, z_history, motion_mask=None):
         """
-        Generate a foreground mask based on the input data.
-
-        Args:
-            images_dict (Dict): a dictionary, should contain 'current' and 'next' key, 
-                               corresponds to t and t+1 's image tensor at time.
-                               Shape: [B, C, H, W].
-            z_dict (Dict): a dictionary, should contain 'current' and 'next' key, 
-                           corresponds to t and t+1 's feature tensor at time.
-                           Shape: [B, N, D].
-
-        Returns:
-            torch.Tensor: the final foreground mask M_final, shape [B, N], dtype=torch.bool.
+        z_history: (B, T, N, D) concatenated visual / proprio / action embeddings.
+        motion_mask: (B, N) token selection (stages 2 and 3).
         """
-        B = images_dict['current'].shape[0]
-        device = images_dict['current'].device
+        if self.use_history:
+            z_history = self.history_fusion(z_history)
 
-        # --- step A: Calculate the original change norm map (Norm Map) ---
-        if self.mode == 'pixel':
-            images_current = images_dict['current']
-            images_next = images_dict['next']
-            
-            # Calculate pixel difference
-            pixel_diff = images_next - images_current  # shape: [B, C, H, W]
+        if self.training_stage == "localization":
+            logits = self.localizer(z_history)  # (B, N, 4)
+            return rearrange(logits, "b (h w) (p1 p2) -> b (h p1 w p2)", h=PATCH_GRID, w=PATCH_GRID, p1=2, p2=2)
 
-            # Calculate for each pixel L2 the square of the norm (sum over the channel dimension)
-            pixel_norms_sq = torch.sum(pixel_diff.pow(2), dim=1, keepdim=True) # shape: [B, 1, H, W]
-
-            # aggregate pixel-level differences to the patch-level using average pooling patch level
-            patch_size_h = images_current.shape[2] // self.grid_h // int(math.sqrt(self.partition_precision))
-            patch_size_w = images_current.shape[3] // self.grid_w // int(math.sqrt(self.partition_precision))
-            pool_kernel = (patch_size_h, patch_size_w)
-
-            patch_norms_sq = F.avg_pool2d(
-                pixel_norms_sq, 
-                kernel_size=pool_kernel, 
-                stride=pool_kernel
-            ) # shape: [B, 1, grid_h, grid_w]
-
-            # take the square root and flatten, get for each patch 's RMS norm
-            norms = torch.sqrt(patch_norms_sq).view(B, self.n_patches, -1) # shape: [B, N, _]
-            threshold = self.pixel_threshold
-
-        elif self.mode == 'feature':
-            z_current = z_dict['current']
-            z_next = z_dict['next']
-            
-            # Calculate feature difference
-            delta_z = z_next - z_current # shape: [B, N, D]
-            
-            # Calculate the feature difference's L2 norm
-            norms = torch.norm(delta_z[..., :self.d_feature], p=2, dim=-1).view(B, self.n_patches, -1) # shape: [B, N, _]
-            threshold = self.feature_threshold
-        
-        else:
-            raise ValueError(f"unknown mode: {self.mode}")
-
-        # --- step B: Apply threshold ---
-        
-        # 1. Apply threshold, obtain the original binary mask
-        M_final = (norms > threshold) # shape: [B, N], dtype=torch.bool
-
-        return M_final
+        mask = motion_mask > 0.01
+        x = z_history[:, -1]  # (B, N, D)
+        B, N, D = x.shape
+        mem_tokens = self.primary_predictor(x, mask)  # (B, k, D)
+        pred = torch.zeros(B, N, D, device=x.device, dtype=x.dtype)
+        pred[mask] = mem_tokens.view(-1, D)
+        if self.training_stage == "lrm":
+            _, idx_tgt = self.lrm.mask_to_indices(mask)
+            idx_tgt = idx_tgt.unsqueeze(-1).expand(-1, -1, D)
+            updated_tgt = self.lrm(tgt_tokens=x.gather(1, idx_tgt), mem_tokens=mem_tokens, mem_mask=mask)
+            pred.scatter_(1, idx_tgt, updated_tgt)
+        return pred[..., : self.d_visual + self.d_proprio_embed]

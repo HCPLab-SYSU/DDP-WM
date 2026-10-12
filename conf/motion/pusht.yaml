@@ -1,0 +1,4 @@
+# DDP-WM settings for pusht
+use_history: true      # Historical Information Fusion: cross-attend from the current frame to the two previous frames
+mask_dilation: 0       # dilate the change mask on the patch grid: 0 (off), 4 or 8 connectivity
+num_motion_tokens: 32  # foreground patches predicted per frame in stages 2 and 3

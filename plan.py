@@ -9,37 +9,23 @@ import wandb
 import logging
 import warnings
 import numpy as np
-import submitit
-from itertools import product
 from pathlib import Path
 from einops import rearrange
 from omegaconf import OmegaConf, open_dict
 
-# from env.venv import SubprocVectorEnv
-from custom_resolvers import replace_slash
+from custom_resolvers import replace_slash  # noqa: F401  (registers the resolver used in plan_*.yaml)
 from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
-
-ALL_MODEL_KEYS = [
-    "encoder",
-    "predictor",
-    "decoder",
-    "proprio_encoder",
-    "action_encoder",
-]
+# W&B logs are kept locally unless WANDB_MODE is set (e.g. WANDB_MODE=online)
+os.environ.setdefault("WANDB_MODE", "offline")
 
 
 def _resolve_train_cfg_path(model_dir: Path) -> Path:
-    """
-    Compatible with multiple training output structures:
-      1) <run>/hydra.yaml              (your current Trainer written by)
-      2) <hydra_output>/.hydra/config.yaml
-      3) <run>/config.yaml            (run.py written by unified config)
-    """
+    """Find the training config saved next to a checkpoint."""
     candidates = [
         model_dir / "hydra.yaml",
         model_dir / ".hydra" / "config.yaml",
@@ -49,82 +35,8 @@ def _resolve_train_cfg_path(model_dir: Path) -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        f"Cannot find training config in: {model_dir}. Tried: "
-        + ", ".join(str(x) for x in candidates)
+        f"Cannot find training config in: {model_dir}. Tried: " + ", ".join(str(x) for x in candidates)
     )
-
-
-def planning_main_in_dir(working_dir, cfg_dict):
-    os.chdir(working_dir)
-    return planning_main(cfg_dict=cfg_dict)
-
-
-def launch_plan_jobs(
-    epoch,
-    cfg_dicts,
-    plan_output_dir,
-):
-    with submitit.helpers.clean_env():
-        jobs = []
-        for cfg_dict in cfg_dicts:
-            subdir_name = f"{cfg_dict['planner']['name']}_goal_source={cfg_dict['goal_source']}_goal_H={cfg_dict['goal_H']}_alpha={cfg_dict['objective']['alpha']}"
-            subdir_path = os.path.join(plan_output_dir, subdir_name)
-            executor = submitit.AutoExecutor(folder=subdir_path, slurm_max_num_timeout=20)
-            executor.update_parameters(
-                **{
-                    k: v
-                    for k, v in cfg_dict["hydra"]["launcher"].items()
-                    if k != "submitit_folder"
-                }
-            )
-            cfg_dict["saved_folder"] = subdir_path
-            cfg_dict["wandb_logging"] = False  # don't init wandb
-            job = executor.submit(planning_main_in_dir, subdir_path, cfg_dict)
-            jobs.append((epoch, subdir_name, job))
-            print(
-                f"Submitted evaluation job for checkpoint: {subdir_path}, job id: {job.job_id}"
-            )
-        return jobs
-
-
-def build_plan_cfg_dicts(
-    plan_cfg_path="",
-    ckpt_base_path="",
-    model_name="",
-    model_epoch="final",
-    planner=["gd", "cem"],
-    goal_source=["dset"],
-    goal_H=[1, 5, 10],
-    alpha=[0, 0.1, 1],
-):
-    """
-    Return a list of plan overrides, for model_path, add a key in the dict {"model_path": model_path}.
-    """
-    config_path = os.path.dirname(plan_cfg_path)
-    overrides = [
-        {
-            "planner": p,
-            "goal_source": g_source,
-            "goal_H": g_H,
-            "ckpt_base_path": ckpt_base_path,
-            "model_name": model_name,
-            "model_epoch": model_epoch,
-            "objective": {"alpha": a},
-        }
-        for p, g_source, g_H, a in product(planner, goal_source, goal_H, alpha)
-    ]
-    cfg = OmegaConf.load(plan_cfg_path)
-    cfg_dicts = []
-    for override_args in overrides:
-        planner = override_args["planner"]
-        planner_cfg = OmegaConf.load(os.path.join(config_path, f"planner/{planner}.yaml"))
-        cfg["planner"] = OmegaConf.merge(cfg.get("planner", {}), planner_cfg)
-        override_args.pop("planner")
-        cfg = OmegaConf.merge(cfg, OmegaConf.create(override_args))
-        cfg_dict = OmegaConf.to_container(cfg)
-        cfg_dict["planner"]["horizon"] = cfg_dict["goal_H"]  # assume planning horizon equals to goal horizon
-        cfg_dicts.append(cfg_dict)
-    return cfg_dicts
 
 
 class PlanWorkspace:
@@ -156,9 +68,7 @@ class PlanWorkspace:
         self.action_dim = self.dset.action_dim * self.frameskip
         self.debug_dset_init = cfg_dict["debug_dset_init"]
 
-        objective_fn = hydra.utils.call(
-            cfg_dict["objective"],
-        )
+        objective_fn = hydra.utils.call(cfg_dict["objective"])
 
         self.data_preprocessor = Preprocessor(
             action_mean=self.dset.action_mean,
@@ -188,9 +98,7 @@ class PlanWorkspace:
             n_plot_samples=self.cfg_dict["n_plot_samples"],
         )
 
-        if self.wandb_run is None or isinstance(
-            self.wandb_run, wandb.sdk.lib.disabled.RunDisabled
-        ):
+        if self.wandb_run is None or isinstance(self.wandb_run, wandb.sdk.lib.disabled.RunDisabled):
             self.wandb_run = DummyWandbRun()
 
         self.log_filename = "logs.json"  # planner and final eval logs are dumped here
@@ -206,7 +114,7 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        # optional: assume planning horizon equals to goal horizon
+        # the planning horizon equals the goal horizon
         from planning.mpc import MPCPlanner
 
         if isinstance(self.planner, MPCPlanner):
@@ -218,21 +126,13 @@ class PlanWorkspace:
         self.dump_targets()
 
     def prepare_targets(self):
-        states = []
-        actions = []
-        observations = []
-
         if self.goal_source == "random_state":
             # update env config from val trajs
-            observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(traj_len=2)
-            )
+            observations, states, actions, env_info = self.sample_traj_segment_from_dset(traj_len=2)
             self.env.update_env(env_info)
 
             # sample random states
-            rand_init_state, rand_goal_state = self.env.sample_random_init_goal_states(
-                self.eval_seed
-            )
+            rand_init_state, rand_goal_state = self.env.sample_random_init_goal_states(self.eval_seed)
             if self.env_name == "deformable_env":  # take rand init state from dset for deformable envs
                 rand_init_state = np.array([x[0] for x in states])
 
@@ -251,33 +151,22 @@ class PlanWorkspace:
             self.gt_actions = None
         else:
             # update env config from val trajs
-            observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(
-                    traj_len=self.frameskip * self.goal_H + 1
-                )
+            observations, states, actions, env_info = self.sample_traj_segment_from_dset(
+                traj_len=self.frameskip * self.goal_H + 1
             )
             self.env.update_env(env_info)
 
             # get states from val trajs
-            init_state = [x[0] for x in states]
-            init_state = np.array(init_state)
+            init_state = np.array([x[0] for x in states])
             actions = torch.stack(actions)
             if self.goal_source == "random_action":
                 actions = torch.randn_like(actions)
             wm_actions = rearrange(actions, "b (t f) d -> b t (f d)", f=self.frameskip)
             exec_actions = self.data_preprocessor.denormalize_actions(actions)
             # replay actions in env to get gt obses
-            rollout_obses, rollout_states = self.env.rollout(
-                self.eval_seed, init_state, exec_actions.numpy()
-            )
-            self.obs_0 = {
-                key: np.expand_dims(arr[:, 0], axis=1)
-                for key, arr in rollout_obses.items()
-            }
-            self.obs_g = {
-                key: np.expand_dims(arr[:, -1], axis=1)
-                for key, arr in rollout_obses.items()
-            }
+            rollout_obses, rollout_states = self.env.rollout(self.eval_seed, init_state, exec_actions.numpy())
+            self.obs_0 = {key: np.expand_dims(arr[:, 0], axis=1) for key, arr in rollout_obses.items()}
+            self.obs_g = {key: np.expand_dims(arr[:, -1], axis=1) for key, arr in rollout_obses.items()}
             self.state_0 = init_state  # (b, d)
             self.state_g = rollout_states[:, -1]  # (b, d)
             self.gt_actions = wm_actions
@@ -338,30 +227,18 @@ class PlanWorkspace:
                 },
                 f,
             )
-        file_path = os.path.abspath("plan_targets.pkl")
-        print(f"Dumped plan targets to {file_path}")
+        print(f"Dumped plan targets to {os.path.abspath('plan_targets.pkl')}")
 
     def perform_planning(self):
-        if self.debug_dset_init:
-            actions_init = self.gt_actions
-        else:
-            actions_init = None
-        actions, action_len = self.planner.plan(
-            obs_0=self.obs_0,
-            obs_g=self.obs_g,
-            actions=actions_init,
-        )
+        actions_init = self.gt_actions if self.debug_dset_init else None
+        actions, action_len = self.planner.plan(obs_0=self.obs_0, obs_g=self.obs_g, actions=actions_init)
         logs, successes, _, _ = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
         logs_entry = {
-            key: (
-                value.item()
-                if isinstance(value, (np.float32, np.int32, np.int64))
-                else value
-            )
+            key: (value.item() if isinstance(value, (np.float32, np.int32, np.int64)) else value)
             for key, value in logs.items()
         }
         with open(self.log_filename, "a") as file:
@@ -369,188 +246,76 @@ class PlanWorkspace:
         return logs
 
 
-def load_ckpt(snapshot_path, device):
-    """
-    Loads a checkpoint file. Assumes it's a state_dict payload.
-    """
-    try:
-        with snapshot_path.open("rb") as f:
-            payload = torch.load(f, map_location=device)
-    except:
-        payload = {}
-    return payload
+def load_model(model_ckpt, train_cfg, num_action_repeat, device, motion, feature_decoder_dir=None):
+    """Instantiate the world model from its training config and load a state_dict checkpoint.
 
-
-def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-    """
-    (Hybrid Loader)
-    Instantiates models and loads weights from a checkpoint.
-    Automatically handles two formats:
-    1. [New Format]: Checkpoint contains state_dicts and 'dataset_info'.
-    2. [Old Format]: Checkpoint contains pickled torch.nn.Module objects.
+    ``motion`` holds the per-environment DDP-WM settings (see conf/motion). The frozen history fusion
+    and localizer that the checkpoint carries are loaded by the world model.
     """
     if not model_ckpt.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {model_ckpt}")
+    payload = torch.load(model_ckpt, map_location=device)
+    if "dataset_info" not in payload:
+        raise ValueError(f"Checkpoint {model_ckpt} has no 'dataset_info'; it was not saved by train.py.")
+    if not train_cfg.has_predictor:
+        raise ValueError("Predictor is required for planning.")
+    log.info(f"Loading state_dict from epoch {payload.get('epoch', 'N/A')}: {model_ckpt}")
 
-    # 1. Load the original payload
-    payload = load_ckpt(model_ckpt, device)
+    proprio_emb_dim = train_cfg.proprio_emb_dim
+    action_emb_dim = train_cfg.action_emb_dim
+    encoder = hydra.utils.instantiate(train_cfg.encoder)
+    proprio_encoder = hydra.utils.instantiate(
+        train_cfg.proprio_encoder, in_chans=payload["dataset_info"]["proprio_dim"], emb_dim=proprio_emb_dim
+    )
+    action_encoder = hydra.utils.instantiate(
+        train_cfg.action_encoder, in_chans=payload["dataset_info"]["action_dim"], emb_dim=action_emb_dim
+    )
+    predictor = hydra.utils.instantiate(
+        train_cfg.predictor,
+        num_frames=train_cfg.num_hist,
+        d_visual=encoder.emb_dim,
+        d_action_embed=proprio_emb_dim * train_cfg.num_proprio_repeat,
+        d_proprio_embed=action_emb_dim * train_cfg.num_action_repeat,
+        training_stage=train_cfg.model.training_stage,
+        use_history=motion["use_history"],
+        init_ckpt=None,  # the weights come from model_ckpt
+        num_queries=motion["num_motion_tokens"],
+    )
+    decoder = None
+    if train_cfg.get("has_decoder", False):
+        decoder = hydra.utils.instantiate(train_cfg.decoder, emb_dim=encoder.emb_dim)
 
-    # 2. Differentiate formats
-    # Check 'encoder' the key's value.if it is dict, is considered state_dict (new)
-    # otherwise, is considered model object (old)
-    # we also check for 'dataset_info' as a clear signal for the new format
-    is_state_dict_format = "dataset_info" in payload or isinstance(payload.get("encoder", None), dict)
+    for name, module in [
+        ("encoder", encoder), ("proprio_encoder", proprio_encoder), ("action_encoder", action_encoder), ("decoder", decoder)
+    ]:
+        if module is not None and name in payload:
+            module.load_state_dict(payload[name])
+    # the history fusion and localizer keys are loaded by the world model (FrozenLocalizer)
+    predictor.load_state_dict(payload["predictor"], strict=False)
 
-    components = {}
+    if feature_decoder_dir:
+        # image decoder of the original DINO-WM checkpoint, for rendering predicted features (tools.decode_features)
+        import tools
 
-    if is_state_dict_format:
-        # --- [New Format Logic (state_dict)] ---
-        log.info(
-            f"Loading state_dict (New Format) from epoch {payload.get('epoch', 'N/A')}: {model_ckpt}"
-        )
+        tools.load_feature_decoder(feature_decoder_dir, device)
 
-        if "dataset_info" not in payload:
-            raise ValueError(
-                f"Checkpoint {model_ckpt} is state_dict format but missing 'dataset_info'. Please re-save with new train.py."
-            )
-
-        # 2a. from payload Get dimensions
-        proprio_dim = payload["dataset_info"]["proprio_dim"]
-        action_dim = payload["dataset_info"]["action_dim"]
-        proprio_emb_dim = train_cfg.proprio_emb_dim
-        action_emb_dim = train_cfg.action_emb_dim
-
-        # 3a. Instantiate empty models
-        encoder = hydra.utils.instantiate(train_cfg.encoder)
-        proprio_encoder = hydra.utils.instantiate(
-            train_cfg.proprio_encoder, in_chans=proprio_dim, emb_dim=proprio_emb_dim
-        )
-        action_encoder = hydra.utils.instantiate(
-            train_cfg.action_encoder, in_chans=action_dim, emb_dim=action_emb_dim
-        )
-
-        if not train_cfg.has_predictor:
-            raise ValueError("Predictor is required for planning.")
-
-        encoder_emb_dim = encoder.emb_dim
-        decoder_scale = 16  # from vqvae
-        num_side_patches = train_cfg.img_size // decoder_scale
-        num_patches = num_side_patches**2
-        predictor = hydra.utils.instantiate(
-            train_cfg.predictor,
-            num_patches=num_patches,
-            dim=encoder_emb_dim + proprio_emb_dim + action_emb_dim,
-            num_frames=train_cfg.num_hist,
-            d_visual=encoder_emb_dim,
-            d_action_embed=proprio_emb_dim * train_cfg.num_proprio_repeat,
-            d_proprio_embed=action_emb_dim * train_cfg.num_action_repeat,
-        )
-
-        decoder = None
-        if train_cfg.has_decoder:
-            decoder = hydra.utils.instantiate(train_cfg.decoder, emb_dim=encoder_emb_dim)
-
-        # 4a. Load state_dicts
-        def load_state(model, model_name):
-            if model is not None and model_name in payload:
-                try:
-                    model.load_state_dict(payload[model_name])
-                    log.info(f"Loaded state_dict for {model_name}")
-                except Exception as e:
-                    log.error(f"Failed to load state_dict for {model_name}. Error: {e}")
-
-        load_state(encoder, "encoder")
-        load_state(proprio_encoder, "proprio_encoder")
-        load_state(action_encoder, "action_encoder")
-        load_state(predictor, "predictor")
-        load_state(decoder, "decoder")
-
-        # 5a. Collect components
-        components = {
-            "encoder": encoder,
-            "proprio_encoder": proprio_encoder,
-            "action_encoder": action_encoder,
-            "predictor": predictor,
-            "decoder": decoder,
-            "proprio_dim": proprio_emb_dim,
-            "action_dim": action_emb_dim,
-        }
-
-    else:
-        # --- [Old Format Logic (Pickled Objects)] ---
-        log.info(
-            f"Loading pickled model objects (Old Format) from epoch {payload.get('epoch', 'N/A')}: {model_ckpt}"
-        )
-
-        # 2b. (Simulate the original load_ckpt 's behavior)
-        result = {}
-        for k, v in payload.items():
-            if k in ALL_MODEL_KEYS:
-                # Ensure loading to the correct device
-                if isinstance(v, torch.nn.Module):
-                    result[k] = v.to(device)
-                else:
-                    log.warning(
-                        f"Key {k} in old checkpoint is not an nn.Module, skipping .to(device)."
-                    )
-                    result[k] = v
-
-        # 3b. (Simulate the original load_model 's behavior: Handle missing keys)
-        if "encoder" not in result:
-            log.warning("Encoder not found in old checkpoint. Instantiating new one.")
-            result["encoder"] = hydra.utils.instantiate(train_cfg.encoder).to(device)
-        if "predictor" not in result:
-            raise ValueError("Predictor not found in model checkpoint (Old Format)")
-
-        if "proprio_encoder" not in result or "action_encoder" not in result:
-            log.error("Proprio/Action encoder not found in old checkpoint. This is fatal for old format.")
-            raise ValueError("Proprio/Action encoder missing from old checkpoint.")
-
-        if train_cfg.has_decoder and "decoder" not in result:
-            log.warning("Decoder not found in old checkpoint. Loading from VQVAE path...")
-            base_path = os.path.dirname(os.path.abspath(__file__))  # Assuming plan.py path
-            if train_cfg.env.decoder_path is not None:
-                decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-                ckpt = torch.load(decoder_path, map_location=device)
-                if isinstance(ckpt, dict):
-                    result["decoder"] = ckpt["decoder"].to(device)
-                else:
-                    result["decoder"] = ckpt.to(device)
-            else:
-                raise ValueError("Decoder path not found in config (Old Format load failed)")
-        elif not train_cfg.has_decoder:
-            result["decoder"] = None
-
-        # 5b. Collect components
-        components = {
-            "encoder": result["encoder"],
-            "proprio_encoder": result["proprio_encoder"],
-            "action_encoder": result["action_encoder"],
-            "predictor": result["predictor"],
-            "decoder": result["decoder"],
-            # The old format relies on train_cfg to get these dimensions
-            "proprio_dim": train_cfg.proprio_emb_dim,
-            "action_dim": train_cfg.action_emb_dim,
-        }
-
-    # --- [The final common step] ---
-    # 6. Instantiate WorldModel wrapper
     model = hydra.utils.instantiate(
         train_cfg.model,
-        encoder=components["encoder"],
-        proprio_encoder=components["proprio_encoder"],
-        action_encoder=components["action_encoder"],
-        predictor=components["predictor"],
-        decoder=components["decoder"],
-        proprio_dim=components["proprio_dim"],
-        action_dim=components["action_dim"],
+        encoder=encoder,
+        proprio_encoder=proprio_encoder,
+        action_encoder=action_encoder,
+        predictor=predictor,
+        decoder=decoder,
+        motion=motion,
+        ckpt_path=model_ckpt,
+        proprio_dim=proprio_emb_dim,
+        action_dim=action_emb_dim,
         concat_dim=train_cfg.concat_dim,
         num_action_repeat=num_action_repeat,
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
-
     model.to(device)
-    model.eval()  # Ensure it is always in evaluation mode during planning
+    model.eval()
     return model
 
 
@@ -577,23 +342,25 @@ def planning_main(cfg_dict):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if cfg_dict["wandb_logging"]:
         wandb_run = wandb.init(project=f"plan_{cfg_dict['planner']['name']}", config=cfg_dict)
-        wandb.run.name = "{}".format(output_dir.split("plan_outputs/")[-1])
+        wandb.run.name = output_dir.split("plan_outputs/")[-1]
     else:
         wandb_run = None
 
-    # 1) Compatible:The new framework uses model_path points directly to runs/run_xxxxx；the old framework can still use ckpt_base_path/outputs/model_name
-    model_path = cfg_dict.get("model_path", None) or cfg_dict.get("target_run_path", None)
+    # model_path points straight at a run directory; otherwise use ckpt_base_path/outputs/model_name
+    model_path = cfg_dict.get("model_path", None)
     if model_path is None or str(model_path).strip() == "":
-        ckpt_base_path = cfg_dict["ckpt_base_path"]
-        model_path = f"{ckpt_base_path}/outputs/{cfg_dict['model_name']}/"
+        model_path = f"{cfg_dict['ckpt_base_path']}/outputs/{cfg_dict['model_name']}/"
     model_dir = Path(str(model_path)).expanduser()
     if not model_dir.is_absolute():
-        # Hydra will chdir to the run directory，must use original_cwd to be able to repo resolve from the root directory
+        # hydra changes the working directory, so resolve relative paths against the original one
         model_dir = Path(hydra.utils.get_original_cwd()) / model_dir
     model_dir = model_dir.resolve()
 
-    train_cfg_path = _resolve_train_cfg_path(model_dir)
-    model_cfg = OmegaConf.load(train_cfg_path)
+    model_cfg = OmegaConf.load(_resolve_train_cfg_path(model_dir))
+    # DDP-WM settings: those saved with the model, optionally overridden by a `motion` block in the planning config
+    motion = OmegaConf.to_container(
+        OmegaConf.merge(model_cfg.get("motion", {}), cfg_dict.get("motion") or {}), resolve=True
+    )
 
     seed(cfg_dict["seed"])
     _, dset = hydra.utils.call(
@@ -604,20 +371,30 @@ def planning_main(cfg_dict):
     )
     dset = dset["valid"]
 
-    # 2) More robust:num_action_repeat it might not be specified, defaulting to 1(as you do in other scripts)
     num_action_repeat = model_cfg.get("num_action_repeat", 1)
 
-    # 3) checkpoint:prioritize checkpoint_name，otherwise use model_epoch -> model_{epoch}.pth (epoch=latest => model_latest.pth)
+    # checkpoint: checkpoint_name if given, else model_{model_epoch}.pth (latest -> model_latest.pth)
     checkpoint_name = cfg_dict.get("checkpoint_name", None)
     if checkpoint_name is not None and str(checkpoint_name).strip() != "":
         model_ckpt = model_dir / "checkpoints" / str(checkpoint_name)
     else:
         model_ckpt = model_dir / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
 
-    model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
+    model = load_model(
+        model_ckpt, model_cfg, num_action_repeat, device=device, motion=motion,
+        feature_decoder_dir=cfg_dict.get("feature_decoder_model"),
+    )
 
-    # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+    # use dummy vector envs for wall and the deformable envs
+    if model_cfg.env.name == "deformable_env":
+        # PyFleX is a process-wide singleton and crashes when several scenes are created in one process,
+        # so a single simulator serves all evaluation instances
+        from env.serial_vector_env import LazySerialVectorEnv
+
+        env = LazySerialVectorEnv(
+            gym.make(model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs), cfg_dict["n_evals"]
+        )
+    elif model_cfg.env.name == "wall":
         from env.serial_vector_env import SerialVectorEnv
 
         env = SerialVectorEnv(
@@ -628,11 +405,10 @@ def planning_main(cfg_dict):
         )
     else:
         from env.venv import SubprocVectorEnv
+
         env = SubprocVectorEnv(
             [
-                lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
+                lambda: gym.make(model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs)
                 for _ in range(cfg_dict["n_evals"])
             ]
         )
@@ -646,9 +422,7 @@ def planning_main(cfg_dict):
         frameskip=model_cfg.frameskip,
         wandb_run=wandb_run,
     )
-
-    logs = plan_workspace.perform_planning()
-    return logs
+    return plan_workspace.perform_planning()
 
 
 @hydra.main(config_path="conf", config_name="plan")
@@ -656,8 +430,14 @@ def main(cfg: OmegaConf):
     with open_dict(cfg):
         cfg["saved_folder"] = os.getcwd()
         log.info(f"Planning result saved dir: {cfg['saved_folder']}")
+    OmegaConf.resolve(cfg)
     cfg_dict = cfg_to_dict(cfg)
-    cfg_dict["wandb_logging"] = True
+    # hydra changes the working directory; make checkpoint paths absolute
+    cfg_dict["ckpt_base_path"] = hydra.utils.to_absolute_path(cfg_dict["ckpt_base_path"])
+    if cfg_dict.get("feature_decoder_model"):
+        cfg_dict["feature_decoder_model"] = hydra.utils.to_absolute_path(cfg_dict["feature_decoder_model"])
+    # results are written to logs.json; W&B logging is optional (wandb_logging=true)
+    cfg_dict["wandb_logging"] = bool(cfg.get("wandb_logging", False))
     planning_main(cfg_dict)
 
 

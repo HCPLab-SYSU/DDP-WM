@@ -45,10 +45,17 @@ class TrajSubset(TrajDataset, Subset):
         return self.dataset.get_seq_length(self.indices[idx])
 
     def __getattr__(self, name):
-        if hasattr(self.dataset, name):
-            return getattr(self.dataset, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        # fetch 'dataset' with object.__getattribute__ to avoid infinite recursion
+        try:
+            dataset = object.__getattribute__(self, 'dataset')
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute 'dataset', cannot delegate for '{name}'")
 
+        # delegate to the wrapped dataset
+        if hasattr(dataset, name):
+            return getattr(dataset, name)
+        else:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 class TrajSlicerDataset(TrajDataset):
     def __init__(
@@ -91,11 +98,13 @@ class TrajSlicerDataset(TrajDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, state, _ = self.dataset[i]
-        for k, v in obs.items():
-            obs[k] = v[start:end:self.frameskip]
-        state = state[start:end:self.frameskip]
-        act = act[start:end]
+        dataset = self.dataset
+        while isinstance(dataset, Subset):  # trajectory index in the underlying dataset
+            i = dataset.indices[i]
+            dataset = dataset.dataset
+        # load only the frames of this slice; the actions are needed for every step in [start, end)
+        obs, _, state, _ = dataset.get_frames(i, range(start, end, self.frameskip))
+        act = dataset.actions[i, start:end]
         act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)  # concat actions
         return tuple([obs, act, state])
 

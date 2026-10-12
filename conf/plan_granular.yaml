@@ -1,0 +1,43 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+
+# model to load for planning
+ckpt_base_path: ./checkpoints  # ${ckpt_base_path}/outputs/${model_name}/checkpoints/model_${model_epoch}.pth
+model_name: ddpwm_granular
+model_epoch: latest
+# original DINO-WM Granular checkpoint; its image decoder renders predicted features (tools.decode_features)
+feature_decoder_model: ${ckpt_base_path}/outputs/dinowm_granular
+
+seed: 99
+n_evals: 10          # Rope and Granular are evaluated on 10 instances
+goal_source: 'dset'  # goals sampled from the dataset
+goal_H: 5
+n_plot_samples: 10
+
+debug_dset_init: False
+
+objective:
+  _target_: planning.objectives.create_objective_fn
+  alpha: 1
+  base: 2
+  mode: last
+
+planner:
+  _target_: planning.mpc.MPCPlanner
+  max_iter: 3  # the CD-based success never stops MPC early; the reported CD is the best of the 3 iterations
+  n_taken_actions: 5
+  sub_planner:
+    target: planning.cem.CEMPlanner
+    horizon: 5
+    topk: 30
+    num_samples: 300
+    var_scale: 1
+    opt_steps: 30
+    eval_every: 30  # PyFleX evaluation only after the first CEM step (slow); the CD-based success never stops CEM early
+    use_cost_mask: true  # Sparse MPC Cost Mask (planning/cem.py)
+    mask_dilation: 8  # Sparse MPC Cost Mask dilation: 0 (off), 4 or 8 connectivity
+  name: mpc_cem

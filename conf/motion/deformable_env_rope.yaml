@@ -1,0 +1,4 @@
+# DDP-WM settings for rope
+use_history: false     # predict from the current frame only
+mask_dilation: 0       # dilate the change mask on the patch grid: 0 (off), 4 or 8 connectivity
+num_motion_tokens: 32  # foreground patches predicted per frame in stages 2 and 3

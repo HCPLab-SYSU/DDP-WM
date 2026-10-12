@@ -1,369 +1,258 @@
+"""DDP-WM world model: predicts the next frame through a small set of foreground tokens.
+
+See ``models/ddp_predictor.py`` for the three training stages. The per-environment settings
+(use_history, mask_dilation, num_motion_tokens) come from the ``motion`` config group.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from torchvision import transforms
-from PIL import Image
-from einops import rearrange, repeat
-import torch
-import torch.nn as nn
-from einops import rearrange, repeat
-from typing import Dict, List, Optional, Tuple
-from .utils import *
+
+from .ddp_predictor import CLS_POS_WEIGHT, PATCH_GRID, FrozenLocalizer, LabelGenerator
+
+# Number of frames the predictor attends to when use_history is on (current frame + 2 past frames).
+NUM_HISTORY_FRAMES = 3
+# Predicted patch features with an L2 norm at or below this value keep the previous frame's feature.
+FEATURE_NORM_THRESHOLD = 10.0
 
 
 class DDPVWorldModel(nn.Module):
     def __init__(
         self,
-        image_size,  # 224
+        image_size,
         num_hist,
         num_pred,
         encoder,
         proprio_encoder,
         action_encoder,
         decoder,
-        predictor, 
-        label_generator,
-        cls_pos_weight=10,
-        predictor_criterion=None, 
+        predictor,
+        training_stage,
+        motion,
+        ckpt_path=None,
         proprio_dim=0,
         action_dim=0,
-        concat_dim=0,
-        num_action_repeat=7,
-        num_proprio_repeat=7,
-        train_encoder=True,
-        train_predictor=False,
-        train_decoder=True,
-        training_stage=''
+        concat_dim=1,
+        num_action_repeat=1,
+        num_proprio_repeat=1,
+        train_encoder=False,
+        train_predictor=True,
+        train_decoder=False,
+        **unused,
     ):
+        """``decoder`` is accepted for config compatibility but not used (the model never decodes images).
+
+        ``ckpt_path`` (stages 2 and 3): checkpoint the frozen history fusion, localizer and proprio/action
+        encoders are taken from; any checkpoint from stage 1 on carries them.
+        """
         super().__init__()
-        self.num_hist = num_hist
+        assert concat_dim == 1, "Only concat_dim=1 (feature concatenation) is supported"
+        self.training_stage = training_stage
+        self.use_history = motion["use_history"]
+        self.num_hist = 3 if training_stage == "localization" else 5
         self.num_pred = num_pred
         self.encoder = encoder
         self.proprio_encoder = proprio_encoder
         self.action_encoder = action_encoder
-        self.decoder = decoder  # decoder could be None
-        self.predictor = predictor  # predictor could be None
-        self.label_generator = label_generator
+        self.decoder = None
+        self.predictor = predictor
         self.train_encoder = train_encoder
         self.train_predictor = train_predictor
         self.train_decoder = train_decoder
         self.num_action_repeat = num_action_repeat
         self.num_proprio_repeat = num_proprio_repeat
-        self.proprio_dim = proprio_dim * num_proprio_repeat 
-        self.action_dim = action_dim * num_action_repeat 
         self.concat_dim = concat_dim
-        self.cls_pos_weight = cls_pos_weight
-        self.training_stage = training_stage
-
-        self.emb_dim = self.encoder.emb_dim + (self.action_dim + self.proprio_dim) * (concat_dim) 
-        print("Model emb_dim: ", self.emb_dim)
+        self.proprio_dim = proprio_dim * num_proprio_repeat
+        self.action_dim = action_dim * num_action_repeat
+        self.emb_dim = self.encoder.emb_dim + self.action_dim + self.proprio_dim
         self.d_visual = self.emb_dim - self.action_dim - self.proprio_dim
         self.d_state = self.d_visual + self.proprio_dim
 
-        # --- loss function ---
-        # According to different training stages，Define required loss functions
-        self.localization_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(self.cls_pos_weight))
-        self.dynamics_loss = nn.MSELoss()
-        self.lrm_loss = nn.MSELoss()
-        
         if "dino" in self.encoder.name:
-            decoder_scale = 16
-            num_side_patches = image_size // decoder_scale
-            self.encoder_image_size = num_side_patches * encoder.patch_size
-            self.encoder_transform = transforms.Compose([transforms.Resize(self.encoder_image_size)])
+            self.encoder_transform = transforms.Compose([transforms.Resize(PATCH_GRID * encoder.patch_size)])
         else:
             self.encoder_transform = lambda x: x
+        self.emb_criterion = nn.MSELoss()
 
-        if self.training_stage != 'localization':
-            freeze_module(self.action_encoder)
-            freeze_module(self.proprio_encoder)
+        self.label_generator = LabelGenerator(
+            training_stage=training_stage,
+            mask_dilation=motion["mask_dilation"],
+            num_motion_tokens=motion["num_motion_tokens"],
+            d_state=self.d_state,
+        )
 
-    def __getattr__(self, name):
-        """
-        A convenient attribute getter method.if DDPVWorldModel does not have this attribute itself，
-        it will try to get from self.predictor (DDP_Predictor) find in.
-        This makes accessing attributes of sub-modules externally simple (e.g., model.training_stage).
-        """
-        try:
-            # Prioritize returning its own attributes
-            return super().__getattr__(name)
-        except AttributeError:
-            # If it doesn't have it itself，then try to get from self.predictor get from
-            if hasattr(self, 'predictor') and self.predictor is not None:
-                if hasattr(self.predictor, 'module'):
-                    predictor = self.predictor.module
-                else:
-                    predictor = self.predictor
-            if hasattr(predictor, name):
-                return getattr(predictor, name)
-            else:
-                # if predictor also doesn't have，then throw the original AttributeError
-                raise
+        if training_stage != "localization":
+            # Frozen stage-1 modules; the proprio/action encoders come from the same checkpoint.
+            self.frozen_localizer = FrozenLocalizer(
+                ckpt_path, use_history=self.use_history, num_queries=motion["num_motion_tokens"]
+            )
+            checkpoint = self.frozen_localizer.checkpoint
+            for name in ("proprio_encoder", "action_encoder"):
+                module = getattr(self, name)
+                module = getattr(module, "module", module)  # unwrap DDP
+                module.load_state_dict(checkpoint[name])
+                for param in module.parameters():
+                    param.requires_grad_(False)
+            # The predictor shares them, so that its checkpoints carry the whole model.
+            target = getattr(self.predictor, "module", self.predictor)
+            if self.use_history:
+                target.history_fusion = self.frozen_localizer.history_fusion
+            target.localizer = self.frozen_localizer.localizer
 
     def train(self, mode=True):
         super().train(mode)
         if self.train_encoder:
             self.encoder.train(mode)
-        if self.predictor is not None and self.train_predictor:
+        if self.train_predictor:
             self.predictor.train(mode)
-        if self.training_stage != 'localization':
-            self.proprio_encoder.train(mode)
-            self.action_encoder.train(mode)
-        if self.decoder is not None and self.train_decoder:
-            self.decoder.train(mode)
+        self.proprio_encoder.train(mode)
+        self.action_encoder.train(mode)
+        return self
 
     def eval(self):
         super().eval()
         self.encoder.eval()
-        if self.predictor is not None:
-            self.predictor.eval()
+        self.predictor.eval()
         self.proprio_encoder.eval()
         self.action_encoder.eval()
-        if self.decoder is not None:
-            self.decoder.eval()
+        return self
 
-    def encode(self, obs, act): 
-        """
-        input :  obs (dict): "visual", "proprio", (b, num_frames, 3, img_size, img_size) 
-        output:    z (tensor): (b, num_frames, num_patches, emb_dim)
-        """
+    # ------------------------------------------------------------------ encoding
+
+    def encode(self, obs, act):
+        """obs: dict of (b, t, ...) tensors, act: (b, t, action_dim) -> z: (b, t, num_patches, emb_dim)."""
         z_dct = self.encode_obs(obs)
         act_emb = self.encode_act(act)
-        if self.concat_dim == 0:
-            z = torch.cat(
-                    [z_dct['visual'], z_dct['proprio'].unsqueeze(2), act_emb.unsqueeze(2)], dim=2 # add as an extra token
-                )  # (b, num_frames, num_patches + 2, dim)
-        if self.concat_dim == 1:
-            proprio_tiled = repeat(z_dct['proprio'].unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
-            proprio_repeated = proprio_tiled.repeat(1, 1, 1, self.num_proprio_repeat)
-            act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
-            act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
-            z = torch.cat(
-                [z_dct['visual'], proprio_repeated, act_repeated], dim=3
-            )  # (b, num_frames, num_patches, dim + action_dim)
-        return z
-    
+        num_patches = z_dct["visual"].shape[2]
+        proprio = repeat(z_dct["proprio"].unsqueeze(2), "b t 1 a -> b t f a", f=num_patches)
+        proprio = proprio.repeat(1, 1, 1, self.num_proprio_repeat)
+        act_emb = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=num_patches)
+        act_emb = act_emb.repeat(1, 1, 1, self.num_action_repeat)
+        return torch.cat([z_dct["visual"], proprio, act_emb], dim=3)
+
     def encode_act(self, act):
-        act = self.action_encoder(act) # (b, num_frames, action_emb_dim)
-        return act
-    
+        return self.action_encoder(act)
+
     def encode_proprio(self, proprio):
-        proprio = self.proprio_encoder(proprio)
-        return proprio
+        return self.proprio_encoder(proprio)
 
     def encode_obs(self, obs):
-        """
-        input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
-        output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
-        """
-        visual = obs['visual']
+        """obs: "visual" (b, t, 3, h, w), "proprio" (b, t, d) -> "visual" (b, t, num_patches, d_visual), "proprio" (b, t, d_proprio)."""
+        visual = obs["visual"]
         b = visual.shape[0]
-        visual = rearrange(visual, "b t ... -> (b t) ...")
-        visual = self.encoder_transform(visual)
-        visual_embs = self.encoder.forward(visual)
+        visual = self._resize_frames(visual)
+        visual_embs = self.encoder.forward(rearrange(visual, "b t ... -> (b t) ..."))
         visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
+        return {"visual": visual_embs, "proprio": self.encode_proprio(obs["proprio"])}
 
-        proprio = obs['proprio']
-        proprio_emb = self.encode_proprio(proprio)
-        return {"visual": visual_embs, "proprio": proprio_emb}
-
-    def predict(self, z_history: torch.Tensor) -> torch.Tensor:
-        """
-        Execute single-step inference prediction.
-        This method encapsulates DDP-WM at 'inference' complete forward propagation in mode.
-
-        Args:
-            z_history (torch.Tensor): the input history feature sequence, shape [B, T_hist, N, D_model].
-
-        Returns:
-            torch.Tensor: the predicted complete feature map of the next frame z_{t+1}, shape [B, 1, N, D_model].
-        """
-        # 1. Confirm that the predictor is in inference mode
-        if self.training_stage != 'inference':
-            raise RuntimeError(f"call predict() when, DDP_Predictor 's training_stage must be 'inference', but currently is '{self.training_stage}'")
-        
-        # 2. Call the predictor directly
-        # at 'inference' in mode，It will return a dictionary containing the final prediction
-        predictor_outputs = self.predictor(z_history)
-        
-        # 3. Extract and return the final complete feature map prediction
-        z_t_plus_1 = predictor_outputs['final_prediction'] # Shape: [B, 1, N, D_model]
-        
-        return z_t_plus_1
-
-    def decode(self, z):
-        """
-        input :   z: (b, num_frames, num_patches, emb_dim)
-        output: obs: (b, num_frames, 3, img_size, img_size)
-        """
-        z_obs, z_act = self.separate_emb(z)
-        obs, diff = self.decode_obs(z_obs)
-        return obs, diff
-
-    def decode_obs(self, z_obs):
-        """
-        input :   z: (b, num_frames, num_patches, emb_dim)
-        output: obs: (b, num_frames, 3, img_size, img_size)
-        """
-        b, num_frames, num_patches, emb_dim = z_obs["visual"].shape
-        visual, diff = self.decoder(z_obs["visual"])  # (b*num_frames, 3, 224, 224)
-        visual = rearrange(visual, "(b t) c h w -> b t c h w", t=num_frames)
-        obs = {
-            "visual": visual,
-            "proprio": z_obs["proprio"], # Note: no decoder for proprio for now!
-        }
-        return obs, diff
-    
     def separate_emb(self, z):
-        """
-        input: z (tensor)
-        output: z_obs (dict), z_act (tensor)
-        """
-        if self.concat_dim == 0:
-            z_visual, z_proprio, z_act = z[:, :, :-2, :], z[:, :, -2, :], z[:, :, -1, :]
-        elif self.concat_dim == 1:
-            z_visual, z_proprio, z_act = z[..., :-(self.proprio_dim + self.action_dim)], \
-                                         z[..., -(self.proprio_dim + self.action_dim) :-self.action_dim],  \
-                                         z[..., -self.action_dim:]
-            # remove tiled dimensions
-            z_proprio = z_proprio[:, :, 0, : self.proprio_dim // self.num_proprio_repeat]
-            z_act = z_act[:, :, 0, : self.action_dim // self.num_action_repeat]
-        z_obs = {"visual": z_visual, "proprio": z_proprio}
-        return z_obs, z_act
-
-
-    def forward(self, obs, act):
-        # -------------------------------------------------------------
-        # step 1: Initial encoding (general)
-        # -------------------------------------------------------------
-        z = self.encode(obs, act) # (B, T, N, D)
-        B, T_full, N, D = z.shape
-
-        # -------------------------------------------------------------
-        # step 2: process `trainrollout` logic
-        # -------------------------------------------------------------
-        if self.training_stage not in ['localization', 'lrm']:
-            # This step will userollout's results to replacez's history part
-            z_roll = z[:, :-1]
-            z_roll = get_rollout_z(z_roll, self, obs['visual'], self.num_hist)
-            z = torch.cat([z_roll, z[:, -1:]], dim=1)
-
-        # -------------------------------------------------------------
-        # step 3: Prepare predictor input and ground truth
-        # -------------------------------------------------------------
-        # Regardless of the stage，The predictor requires history input z_history
-        z_history = z[:, -self.num_hist-1:-1, :, :] # (B, T-1, N, D)
-        
-        # -------------------------------------------------------------
-        # step 4: Calculate loss based on the training stage
-        # -------------------------------------------------------------
-        loss = 0
-        loss_components = {}
-        
-        predictor_outputs = self.predictor(z_history)
-
-        if self.training_stage == 'localization':
-            mask_logits = predictor_outputs['mask_logits']
-            
-            # Apply transform when generating labels
-            images_dict = get_ref(obs['visual'],  self)
-            # z_dict temporarily pass inNone，becauselabel_generatorispixelmode
-            gt_mask = self.label_generator(images_dict=images_dict, z_dict=None) 
-            
-            loss = self.localization_loss(mask_logits, gt_mask.float())
-            loss_components['loss_localization'] = loss
-
-        else: # 'primary_predictor' or 'lrm' stage
-            # key_point:generated by the frozen localizermaskto split the ground truth
-            predicted_mask = predictor_outputs['mask']
-            
-            # Get the ground truth features of the next frame
-            z_next_gt_full = z[:, -1, :, :] # (B, N, D)
-            
-            if self.training_stage == 'primary_predictor':
-                pred_fg = predictor_outputs['pred_fg'] # (B, K, D)
-
-                # use predicted_mask from z_next_gt_full extract the ground truth foreground from
-                K = pred_fg.shape[1]
-                gt_fg_next = z_next_gt_full[predicted_mask].view(B, K, D)
-                
-                loss = self.dynamics_loss(pred_fg[...,:self.d_state], gt_fg_next[...,:self.d_state].detach())
-                loss_components['loss_primary'] = loss
-
-            elif self.training_stage == 'lrm':
-                pred_bg = predictor_outputs['pred_bg'] # (B, N-K, D)
-                
-                # use predicted_mask from z_next_gt_full extract the ground truth background from
-                num_bg = pred_bg.shape[1]
-                gt_bg_next = z_next_gt_full[~predicted_mask].view(B, num_bg, D)
-                
-                loss = self.lrm_loss(pred_bg[...,:self.d_state], gt_bg_next[...,:self.d_state].detach())
-                loss_components['loss_lrm'] = loss
-
-        # return，Let the external accelerator.backward(loss) process
-        return None, None, None, loss, loss_components
-
+        """z: (b, t, num_patches, emb_dim) -> z_obs dict, z_act (b, t, action_emb_dim)."""
+        z_visual = z[..., : -(self.proprio_dim + self.action_dim)]
+        z_proprio = z[..., -(self.proprio_dim + self.action_dim) : -self.action_dim]
+        z_act = z[..., -self.action_dim :]
+        # remove tiled dimensions
+        z_proprio = z_proprio[:, :, 0, : self.proprio_dim // self.num_proprio_repeat]
+        z_act = z_act[:, :, 0, : self.action_dim // self.num_action_repeat]
+        return {"visual": z_visual, "proprio": z_proprio}, z_act
 
     def replace_actions_from_z(self, z, act):
-        act_emb = self.encode_act(act)
-        if self.concat_dim == 0:
-            z[:, :, -1, :] = act_emb
-        elif self.concat_dim == 1:
-            act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z.shape[2])
-            act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
-            z[..., -self.action_dim:] = act_repeated
+        act_emb = repeat(self.encode_act(act).unsqueeze(2), "b t 1 a -> b t f a", f=z.shape[2])
+        z[..., -self.action_dim :] = act_emb.repeat(1, 1, 1, self.num_action_repeat)
         return z
 
+    def _resize_frames(self, visual):
+        b = visual.shape[0]
+        visual = self.encoder_transform(rearrange(visual, "b t ... -> (b t) ..."))
+        return rearrange(visual, "(b t) ... -> b t ...", b=b)
+
+    # ------------------------------------------------------------------ prediction
+
+    def _merge_prediction(self, z_t, pred):
+        """Next-frame state: predicted features where their norm exceeds the threshold, z_t elsewhere."""
+        keep = torch.norm(pred, p=2, dim=-1, keepdim=True) > FEATURE_NORM_THRESHOLD
+        return torch.where(keep, pred, z_t[..., : pred.size(-1)])
+
+    def _history_window(self, z):
+        return z[:, -NUM_HISTORY_FRAMES:] if self.use_history else z[:, -1:]
+
+    def _rollout_history(self, z, visual, num_frames):
+        """Teacher-forced rollout used during training (stages 2 and 3).
+
+        Rebuilds frames 1.. of z one step at a time, applying the ground-truth next-frame targets
+        (restricted to the selected foreground tokens in stage 2) to the previously rebuilt frame.
+        Returns the last num_frames frames.
+        """
+        z = z.clone()
+        for i in range(1, z.size(1)):
+            frames = self._resize_frames(visual[:, i - 1 : i + 1])
+            targets, _ = self.label_generator(z[:, i - 1 : i + 1], frames)
+            z[:, i, :, : self.d_state] = self._merge_prediction(z[:, i - 1], targets.squeeze(1))
+        return z[:, -num_frames:]
+
+    def forward(self, obs, act):
+        """Training step: predict the last frame of the window from the frames before it."""
+        z = self.encode(obs, act)
+        if self.training_stage != "localization":
+            num_frames = self.num_hist if self.use_history else 1
+            z = torch.cat([self._rollout_history(z[:, :-1], obs["visual"], num_frames), z[:, -1:]], dim=1)
+        else:
+            z = z[:, -(self.num_hist + 1) :]
+        if self.use_history:
+            z = z[:, -(NUM_HISTORY_FRAMES + 1) :]
+        z_history = z[:, :-1]
+        frames = self._resize_frames(obs["visual"])[:, -2:]
+
+        pred_mask = self.frozen_localizer(z_history).unsqueeze(1) if self.training_stage != "localization" else None
+        targets, mask = self.label_generator(z[:, -2:], frames, pred_mask)
+        mask = mask.squeeze(1).float()
+
+        if self.training_stage == "localization":
+            logits = self.predictor(z_history)
+            pos_weight = torch.tensor(CLS_POS_WEIGHT, device=logits.device)
+            loss = F.binary_cross_entropy_with_logits(logits, mask, pos_weight=pos_weight)
+        else:
+            pred = self.predictor(z_history, mask)
+            loss = F.mse_loss(pred[..., : self.d_state], targets.squeeze(1)[..., : self.d_state])
+
+        loss_components = {"loss_total": loss, "loss": loss}
+        return None, None, None, loss, loss_components
+
+    def _predict_next(self, z_hist, z_pair, frame_pair):
+        """z_hist: (b, t, num_patches, emb_dim) -> next frame (b, 1, num_patches, emb_dim) with zero actions.
+
+        The token selection goes through the same label generator as in training. Only the localizer's
+        change scores are used at planning time, so z_pair / frame_pair are placeholders for the unknown
+        next frame.
+        """
+        pred_mask = self.frozen_localizer(z_hist).unsqueeze(1)
+        _, mask = self.label_generator(z_pair, frame_pair, pred_mask)
+        mask = mask.squeeze(1).float()
+        pred = self.predictor(z_hist, mask)
+        z_next = self._merge_prediction(z_hist[:, -1], pred)
+        return torch.cat([z_next, torch.zeros_like(z_next[..., : self.action_dim])], dim=-1).unsqueeze(1)
 
     def rollout(self, obs_0, act):
+        """Open-loop rollout (stages 2 and 3).
+
+        obs_0: "visual" (b, n, 3, h, w), "proprio" (b, n, d); act: (b, n + T, action_dim)
+        returns z_obses (dict) and z: (b, n + T + 1, num_patches, emb_dim)
         """
-        use DDP-WM predictor performs multi-step execution in an open loop rollout.
-
-        Args:
-            obs_0 (dict): Initial observation, "visual" shape [B, num_obs_init, C, H, W].
-            act (torch.Tensor): The complete action sequence, shape [B, T_total, action_dim].
-                                T_total should be equal to num_obs_init + T_future.
-        
-        Returns:
-            Tuple[Dict, torch.Tensor]: the separated observation embeddings and the completezsequence.
-        """
-        self.eval() # Ensure the entire model is in evaluation mode
-
-        # 1. Encode the initial observation sequence
-        num_obs_init = obs_0['visual'].shape[1]
-        act_0 = act[:, :num_obs_init]
-        z = self.encode(obs_0, act_0)  # Shape: [B, num_obs_init, N, D_model]
-        
-        # 2. Prepare the future action sequence
-        future_actions = act[:, num_obs_init:] # Shape: [B, T_future, action_dim]
-        T_future = future_actions.shape[1]
-        
-        t = 0
-        inc = 1 # predict one frame at a time
-
-        # 3. Loop for multi-step prediction
-        while t < T_future:
-            # a. Prepare the history window for prediction
-            # here self.num_hist is the history length in the model configuration
-            z_history_window = z[:, -self.num_hist:] # Shape: [B, num_hist, N, D_model]
-            
-            # b. Call the single-step prediction method
-            z_pred_next = self.predict(z_history_window) # Shape: [B, 1, N, D_model]
-            
-            # c. Inject the next future action
-            next_action = future_actions[:, t : t + inc] # Shape: [B, 1, action_dim]
-            z_pred_with_action = self.replace_actions_from_z(z_pred_next, next_action)
-            
-            # d. Concatenate the newly predicted frame to the sequence
-            z = torch.cat([z, z_pred_with_action], dim=1)
-            t += inc
-
-        # 4. (optional)Predict one extra step(beyond the last step of the action sequence)
-        z_history_window = z[:, -self.num_hist:]
-        z_pred_final = self.predict(z_history_window)
-        # There is no new action in this step，so it will reuse the last action
-        z = torch.cat([z, z_pred_final], dim=1)
-        
-        # 5. Separate and return the final result
-        z_obses, z_acts = self.separate_emb(z)
+        assert self.training_stage != "localization", "Rollout needs a stage-2 or stage-3 model"
+        self.eval()
+        num_obs_init = obs_0["visual"].shape[1]
+        z = self.encode(obs_0, act[:, :num_obs_init])
+        frames = self._resize_frames(obs_0["visual"])
+        future_actions = act[:, num_obs_init:]
+        for t in range(future_actions.shape[1]):
+            z_hist = self._history_window(z)
+            # random placeholders for the (unknown) next frame pair passed to the label generator
+            frame_pair = torch.rand_like(frames[:, -1:].repeat(1, 2, 1, 1, 1))
+            z_pair = torch.rand_like(z_hist[:, -1:].repeat(1, 2, 1, 1))
+            z_new = self._predict_next(z_hist, z_pair, frame_pair)
+            z_new = self.replace_actions_from_z(z_new, future_actions[:, t : t + 1])
+            z = torch.cat([z, z_new], dim=1)
+        # one more frame beyond the action sequence (its action embedding stays zero)
+        z = torch.cat([z, self._predict_next(self._history_window(z), z_pair, frame_pair)], dim=1)
+        z_obses, _ = self.separate_emb(z)
         return z_obses, z

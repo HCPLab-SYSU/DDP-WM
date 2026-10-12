@@ -5,7 +5,9 @@ import numpy as np
 from einops import rearrange, repeat
 from utils import slice_trajdict_with_t
 from .base_planner import BasePlanner
+# from .sim_wm import SimDynamicsWorldModel
 
+USE_SIM_WM = 0
 
 class MPCPlanner(BasePlanner):
     """
@@ -28,6 +30,15 @@ class MPCPlanner(BasePlanner):
         log_filename="logs.json",
         **kwargs,
     ):
+        if USE_SIM_WM:
+            wm = SimDynamicsWorldModel(
+                env=env,
+                rep_wm=wm,
+                preprocessor=preprocessor,
+                frameskip=evaluator.frameskip,
+                seed=evaluator.seed,
+                strict=True,
+            )
         super().__init__(
             wm,
             action_dim,
@@ -80,6 +91,10 @@ class MPCPlanner(BasePlanner):
         self.action_len = np.full(n_evals, np.inf)
         init_obs_0, init_state_0 = self.evaluator.get_init_cond()
 
+        # simulator-backed world models (if any) are synced to the initial states
+        if hasattr(self.wm, "assign_init_state_batch"):
+            self.wm.assign_init_state_batch(init_state_0)
+
         cur_obs_0 = obs_0
         memo_actions = None
         while not np.all(self.is_success) and self.iter < self.max_iter:
@@ -89,6 +104,7 @@ class MPCPlanner(BasePlanner):
                 obs_g=obs_g,
                 actions=memo_actions,
             )  # (b, t, act_dim)
+            # break
             taken_actions = actions.detach()[:, : self.n_taken_actions]
             self._apply_success_mask(taken_actions)
             memo_actions = actions.detach()[:, self.n_taken_actions :]
@@ -128,6 +144,11 @@ class MPCPlanner(BasePlanner):
                 obs_0=e_final_obs,
                 state_0=e_final_state,
             )
+
+            # keep simulator-backed world models in sync with the executed states
+            if hasattr(self.wm, "assign_init_state_batch"):
+                self.wm.assign_init_state_batch(e_final_state)
+
             self.iter += 1
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
 
